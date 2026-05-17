@@ -17,6 +17,7 @@ export default class OutlineWindow {
 	private _toolbarEl!: HTMLDivElement;
 	private _collapseToggleBtn!: HTMLDivElement;
 	private _allCollapsed = false;
+	private _draggedIndex = -1;
 	private _pinned = false;
 
 	constructor(plugin: DynamicOutlinePlugin, outline: Outline) {
@@ -424,6 +425,10 @@ export default class OutlineWindow {
 			cls: "dynamic-outline-content-container",
 		});
 		contentElement.createEl("ul", {});
+		contentElement.addEventListener("dragstart", (e) => this._onDragStart(e));
+		contentElement.addEventListener("dragover", (e) => this._onDragOver(e));
+		contentElement.addEventListener("drop", (e) => this._onDrop(e));
+		contentElement.addEventListener("dragend", () => this._onDragEnd());
 		mainElement.appendChild(contentElement);
 
 		return mainElement;
@@ -469,6 +474,140 @@ export default class OutlineWindow {
 		if (!ul) return;
 		ul.querySelectorAll("li").forEach((li) => {
 			li.classList.remove("collapsed", "hidden-by-collapse");
+		});
+	}
+
+	private _onDragStart(event: DragEvent): void {
+		const li = (event.target as HTMLElement).closest("li") as HTMLLIElement;
+		if (!li || this._containerEl.classList.contains("is-searching")) {
+			event.preventDefault();
+			return;
+		}
+		this._draggedIndex = parseInt(li.dataset.headingIndex || "-1");
+		if (this._draggedIndex < 0) {
+			event.preventDefault();
+			return;
+		}
+		li.classList.add("dragging");
+		event.dataTransfer?.setData("text/plain", String(this._draggedIndex));
+		if (event.dataTransfer) {
+			event.dataTransfer.effectAllowed = "move";
+		}
+	}
+
+	private _onDragOver(event: DragEvent): void {
+		if (this._draggedIndex < 0) return;
+		event.preventDefault();
+		if (event.dataTransfer) {
+			event.dataTransfer.dropEffect = "move";
+		}
+		this._clearDropIndicators();
+		const li = (event.target as HTMLElement).closest("li") as HTMLLIElement;
+		if (!li) return;
+		const rect = li.getBoundingClientRect();
+		if (event.clientY < rect.top + rect.height / 2) {
+			li.classList.add("drop-indicator-above");
+		} else {
+			li.classList.add("drop-indicator-below");
+		}
+	}
+
+	private _onDrop(event: DragEvent): void {
+		event.preventDefault();
+		this._clearDropIndicators();
+		const li = (event.target as HTMLElement).closest("li") as HTMLLIElement;
+		if (!li || this._draggedIndex < 0) return;
+		const targetIndex = parseInt(li.dataset.headingIndex || "-1");
+		if (targetIndex < 0) return;
+		const rect = li.getBoundingClientRect();
+		const dropBeforeIndex = event.clientY < rect.top + rect.height / 2
+			? targetIndex
+			: targetIndex + 1;
+		this._moveSection(this._draggedIndex, dropBeforeIndex);
+		this._draggedIndex = -1;
+	}
+
+	private _onDragEnd(): void {
+		this._clearDropIndicators();
+		this._containerEl.querySelector(".dragging")?.classList.remove("dragging");
+		this._draggedIndex = -1;
+	}
+
+	private _clearDropIndicators(): void {
+		this._containerEl
+			.querySelectorAll(".drop-indicator-above, .drop-indicator-below")
+			.forEach((el) => el.classList.remove("drop-indicator-above", "drop-indicator-below"));
+	}
+
+	private _getSectionRange(headingIndex: number): { start: number; end: number } {
+		const headings = this._latestHeadings;
+		const startLine = headings[headingIndex].position.start.line;
+		for (let i = headingIndex + 1; i < headings.length; i++) {
+			if (headings[i].level <= headings[headingIndex].level) {
+				return { start: startLine, end: headings[i].position.start.line - 1 };
+			}
+		}
+		return { start: startLine, end: this._outline.view.editor.lastLine() };
+	}
+
+	private _moveSection(fromIndex: number, toIndex: number): void {
+		const headings = this._latestHeadings;
+		if (fromIndex === toIndex || fromIndex === toIndex - 1) return;
+
+		const sourceRange = this._getSectionRange(fromIndex);
+
+		// Prevent dropping within the source section
+		if (toIndex > fromIndex) {
+			let sectionEnd = headings.length;
+			for (let i = fromIndex + 1; i < headings.length; i++) {
+				if (headings[i].level <= headings[fromIndex].level) {
+					sectionEnd = i;
+					break;
+				}
+			}
+			if (toIndex <= sectionEnd) return;
+		}
+
+		const sourceLevel = headings[fromIndex].level;
+		const targetLevel = toIndex < headings.length
+			? headings[toIndex].level
+			: sourceLevel;
+		const levelDelta = targetLevel - sourceLevel;
+
+		if (levelDelta !== 0) {
+			for (let i = fromIndex; i < headings.length; i++) {
+				if (i > fromIndex && headings[i].level <= sourceLevel) break;
+				const newLevel = headings[i].level + levelDelta;
+				if (newLevel < 1 || newLevel > 6) return;
+			}
+		}
+
+		const editor = this._outline.view.editor;
+		const lines = editor.getValue().split("\n");
+		const sourceLines = lines.splice(sourceRange.start, sourceRange.end - sourceRange.start + 1);
+		const adjusted = this._adjustHeadingLevels(sourceLines, levelDelta);
+
+		let targetLine = toIndex < headings.length
+			? headings[toIndex].position.start.line
+			: lines.length;
+		if (targetLine > sourceRange.start) {
+			targetLine -= sourceLines.length;
+		}
+
+		lines.splice(targetLine, 0, ...adjusted);
+
+		const scrollPos = this._outline.view.currentMode.getScroll();
+		editor.setValue(lines.join("\n"));
+		this._outline.view.currentMode.applyScroll(scrollPos);
+	}
+
+	private _adjustHeadingLevels(lines: string[], delta: number): string[] {
+		if (delta === 0) return lines;
+		return lines.map((line) => {
+			const match = line.match(/^(#{1,6})\s/);
+			if (!match) return line;
+			const newLevel = Math.max(1, Math.min(6, match[1].length + delta));
+			return "#".repeat(newLevel) + line.substring(match[1].length);
 		});
 	}
 
