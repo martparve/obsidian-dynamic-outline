@@ -15,6 +15,8 @@ export default class OutlineWindow {
 	private _containerEl: HTMLDivElement;
 	private _latestHeadings: HeadingCache[] = [];
 	private _toolbarEl!: HTMLDivElement;
+	private _collapseToggleBtn!: HTMLDivElement;
+	private _allCollapsed = false;
 	private _pinned = false;
 
 	constructor(plugin: DynamicOutlinePlugin, outline: Outline) {
@@ -149,6 +151,10 @@ export default class OutlineWindow {
 
 		this._latestHeadings = headings;
 		ulElement.empty();
+
+		this._allCollapsed = false;
+		setIcon(this._collapseToggleBtn, "chevrons-down-up");
+		this._collapseToggleBtn.setAttribute("aria-label", "Collapse all");
 
 		let isCollapsingPossibleGlobally = false;
 		if (!this._plugin.settings.disableHeadingCollapsing) {
@@ -400,19 +406,12 @@ export default class OutlineWindow {
 			cls: "dynamic-outline-toolbar hidden",
 		});
 
-		const collapseAllBtn = this._toolbarEl.createDiv({
+		this._collapseToggleBtn = this._toolbarEl.createDiv({
 			cls: "clickable-icon",
 			attr: { "aria-label": "Collapse all" },
 		});
-		setIcon(collapseAllBtn, "chevrons-down-up");
-		collapseAllBtn.addEventListener("click", () => this._collapseAll());
-
-		const expandAllBtn = this._toolbarEl.createDiv({
-			cls: "clickable-icon",
-			attr: { "aria-label": "Expand all" },
-		});
-		setIcon(expandAllBtn, "chevrons-up-down");
-		expandAllBtn.addEventListener("click", () => this._expandAll());
+		setIcon(this._collapseToggleBtn, "chevrons-down-up");
+		this._collapseToggleBtn.addEventListener("click", () => this._toggleCollapseAll());
 
 		mainElement.appendChild(this._toolbarEl);
 
@@ -428,6 +427,20 @@ export default class OutlineWindow {
 		mainElement.appendChild(contentElement);
 
 		return mainElement;
+	}
+
+	private _toggleCollapseAll(): void {
+		if (this._allCollapsed) {
+			this._expandAll();
+			this._allCollapsed = false;
+			setIcon(this._collapseToggleBtn, "chevrons-down-up");
+			this._collapseToggleBtn.setAttribute("aria-label", "Collapse all");
+		} else {
+			this._collapseAll();
+			this._allCollapsed = true;
+			setIcon(this._collapseToggleBtn, "chevrons-up-down");
+			this._collapseToggleBtn.setAttribute("aria-label", "Expand all");
+		}
 	}
 
 	private _collapseAll(): void {
