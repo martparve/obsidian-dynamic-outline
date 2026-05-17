@@ -176,7 +176,8 @@ export default class OutlineWindow {
 		const topLevelCount: number = headings.filter(
 			(h) => h.level === minLevel
 		).length;
-		const hasMultipleTopLevelHeadings: boolean = topLevelCount > 1;
+		const hasMultipleTopLevelHeadings: boolean =
+			topLevelCount > 1 || (topLevelCount === 1 && headings[0].level !== minLevel);
 
 		const fragment: DocumentFragment = document.createDocumentFragment();
 		if (!this._plugin.settings.disableDynamicHeadingIndentation) {
