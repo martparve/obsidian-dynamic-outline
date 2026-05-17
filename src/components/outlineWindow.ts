@@ -152,6 +152,8 @@ export default class OutlineWindow {
 		}
 
 		this._latestHeadings = headings;
+		const contentEl = ulElement.parentElement;
+		const savedScroll = contentEl?.scrollTop ?? 0;
 		ulElement.empty();
 
 		this._allCollapsed = false;
@@ -213,6 +215,7 @@ export default class OutlineWindow {
 			});
 		}
 		ulElement.appendChild(fragment);
+		if (contentEl) contentEl.scrollTop = savedScroll;
 
 		this._containerEl.classList.toggle("has-single-top-level", !hasMultipleTopLevelHeadings);
 
