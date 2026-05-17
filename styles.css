@@ -912,6 +912,14 @@ button.dynamic-outline-reload[disabled] {
 	box-shadow: 0 2px 0 0 var(--interactive-accent);
 }
 
+#dynamic-outline li.level-change-left {
+	box-shadow: -3px 0 0 0 var(--interactive-accent);
+}
+
+#dynamic-outline li.level-change-right {
+	box-shadow: 3px 0 0 0 var(--interactive-accent);
+}
+
 .dynamic-outline-collapse-icon {
 	/* background-color: var(--color-green); */
 	display: flex;

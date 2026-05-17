@@ -18,6 +18,7 @@ export default class OutlineWindow {
 	private _collapseToggleBtn!: HTMLDivElement;
 	private _allCollapsed = false;
 	private _draggedIndex = -1;
+	private _dragStartX = 0;
 	private _pinned = false;
 
 	constructor(plugin: DynamicOutlinePlugin, outline: Outline) {
@@ -492,6 +493,7 @@ export default class OutlineWindow {
 			event.preventDefault();
 			return;
 		}
+		this._dragStartX = event.clientX;
 		li.classList.add("dragging");
 		event.dataTransfer?.setData("text/plain", String(this._draggedIndex));
 		if (event.dataTransfer) {
@@ -508,6 +510,16 @@ export default class OutlineWindow {
 		this._clearDropIndicators();
 		const li = (event.target as HTMLElement).closest("li") as HTMLLIElement;
 		if (!li) return;
+		const targetIndex = parseInt(li.dataset.headingIndex || "-1");
+		if (targetIndex === this._draggedIndex) {
+			const deltaX = event.clientX - this._dragStartX;
+			if (deltaX <= -40) {
+				li.classList.add("level-change-left");
+			} else if (deltaX >= 40) {
+				li.classList.add("level-change-right");
+			}
+			return;
+		}
 		const rect = li.getBoundingClientRect();
 		if (event.clientY < rect.top + rect.height / 2) {
 			li.classList.add("drop-indicator-above");
@@ -523,6 +535,15 @@ export default class OutlineWindow {
 		if (!li || this._draggedIndex < 0) return;
 		const targetIndex = parseInt(li.dataset.headingIndex || "-1");
 		if (targetIndex < 0) return;
+		if (targetIndex === this._draggedIndex) {
+			const deltaX = event.clientX - this._dragStartX;
+			const levelDelta = Math.round(deltaX / 40);
+			if (levelDelta !== 0) {
+				this._changeSectionLevel(this._draggedIndex, levelDelta);
+			}
+			this._draggedIndex = -1;
+			return;
+		}
 		const rect = li.getBoundingClientRect();
 		const dropBeforeIndex = event.clientY < rect.top + rect.height / 2
 			? targetIndex
@@ -535,12 +556,13 @@ export default class OutlineWindow {
 		this._clearDropIndicators();
 		this._containerEl.querySelector(".dragging")?.classList.remove("dragging");
 		this._draggedIndex = -1;
+		this._dragStartX = 0;
 	}
 
 	private _clearDropIndicators(): void {
 		this._containerEl
-			.querySelectorAll(".drop-indicator-above, .drop-indicator-below")
-			.forEach((el) => el.classList.remove("drop-indicator-above", "drop-indicator-below"));
+			.querySelectorAll(".drop-indicator-above, .drop-indicator-below, .level-change-left, .level-change-right")
+			.forEach((el) => el.classList.remove("drop-indicator-above", "drop-indicator-below", "level-change-left", "level-change-right"));
 	}
 
 	private _getSectionRange(headingIndex: number): { start: number; end: number } {
@@ -599,6 +621,29 @@ export default class OutlineWindow {
 		}
 
 		lines.splice(targetLine, 0, ...adjusted);
+
+		const scrollPos = this._outline.view.currentMode.getScroll();
+		editor.setValue(lines.join("\n"));
+		this._outline.view.currentMode.applyScroll(scrollPos);
+	}
+
+	private _changeSectionLevel(headingIndex: number, levelDelta: number): void {
+		const headings = this._latestHeadings;
+		const sourceLevel = headings[headingIndex].level;
+
+		for (let i = headingIndex; i < headings.length; i++) {
+			if (i > headingIndex && headings[i].level <= sourceLevel) break;
+			const newLevel = headings[i].level + levelDelta;
+			if (newLevel < 1 || newLevel > 6) return;
+		}
+
+		const sectionRange = this._getSectionRange(headingIndex);
+		const editor = this._outline.view.editor;
+		const lines = editor.getValue().split("\n");
+		const sectionLines = lines.slice(sectionRange.start, sectionRange.end + 1);
+		const adjusted = this._adjustHeadingLevels(sectionLines, levelDelta);
+
+		lines.splice(sectionRange.start, sectionLines.length, ...adjusted);
 
 		const scrollPos = this._outline.view.currentMode.getScroll();
 		editor.setValue(lines.join("\n"));
