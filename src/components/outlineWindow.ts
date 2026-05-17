@@ -1,5 +1,5 @@
 import DynamicOutlinePlugin, { WINDOW_ID } from "main";
-import { HeadingCache } from "obsidian";
+import { HeadingCache, setIcon } from "obsidian";
 import OutlineLiElement from "./outlineLiElement";
 import SearchContainer from "./searchContainer";
 import * as fuzzysort from "fuzzysort";
@@ -14,6 +14,7 @@ export default class OutlineWindow {
 	private _outline: Outline;
 	private _containerEl: HTMLDivElement;
 	private _latestHeadings: HeadingCache[] = [];
+	private _toolbarEl!: HTMLDivElement;
 	private _pinned = false;
 
 	constructor(plugin: DynamicOutlinePlugin, outline: Outline) {
@@ -157,6 +158,8 @@ export default class OutlineWindow {
 				isCollapsingPossibleGlobally = true;
 			}
 		}
+
+		this._toolbarEl.classList.toggle("hidden", !isCollapsingPossibleGlobally);
 
 		const minLevel: number = Math.min(...headings.map((h) => h.level));
 		const topLevelCount: number = headings.filter(
@@ -393,6 +396,26 @@ export default class OutlineWindow {
 			},
 		});
 
+		this._toolbarEl = createEl("div", {
+			cls: "dynamic-outline-toolbar hidden",
+		});
+
+		const collapseAllBtn = this._toolbarEl.createDiv({
+			cls: "clickable-icon",
+			attr: { "aria-label": "Collapse all" },
+		});
+		setIcon(collapseAllBtn, "chevrons-down-up");
+		collapseAllBtn.addEventListener("click", () => this._collapseAll());
+
+		const expandAllBtn = this._toolbarEl.createDiv({
+			cls: "clickable-icon",
+			attr: { "aria-label": "Expand all" },
+		});
+		setIcon(expandAllBtn, "chevrons-up-down");
+		expandAllBtn.addEventListener("click", () => this._expandAll());
+
+		mainElement.appendChild(this._toolbarEl);
+
 		const searchContainer: SearchContainer = new SearchContainer(
 			this._plugin
 		);
@@ -405,6 +428,35 @@ export default class OutlineWindow {
 		mainElement.appendChild(contentElement);
 
 		return mainElement;
+	}
+
+	private _collapseAll(): void {
+		const ul = this._containerEl.querySelector("ul");
+		if (!ul) return;
+		const items = Array.from(ul.querySelectorAll("li")) as HTMLLIElement[];
+		if (items.length === 0) return;
+
+		const isSingleTopLevel = this._containerEl.classList.contains("has-single-top-level");
+		const minLevel = Math.min(...items.map(li => parseInt(li.dataset.level || "0")));
+		const rootLevel = isSingleTopLevel ? minLevel + 1 : minLevel;
+
+		items.forEach((li) => {
+			const level = parseInt(li.dataset.level || "0");
+			if (li.classList.contains("has-children") && !li.classList.contains("is-single-top-level")) {
+				li.classList.add("collapsed");
+			}
+			if (level > rootLevel) {
+				li.classList.add("hidden-by-collapse");
+			}
+		});
+	}
+
+	private _expandAll(): void {
+		const ul = this._containerEl.querySelector("ul");
+		if (!ul) return;
+		ul.querySelectorAll("li").forEach((li) => {
+			li.classList.remove("collapsed", "hidden-by-collapse");
+		});
 	}
 
 	private _getVisibleLiItems(): Array<HTMLElement> {
