@@ -1,0 +1,2269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+META_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Detect if running from factory/meta/ or root meta/
+if [[ -d "$META_DIR/../factory" ]]; then
+  FACTORY_DIR="$(cd "$META_DIR/../factory" && pwd)"
+  PROJECT_ROOT="$(cd "$META_DIR/.." && pwd)"
+else
+  FACTORY_DIR="$(cd "$META_DIR/.." && pwd)"
+  PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+fi
+FACTORY_DIR_ORIG="$FACTORY_DIR"
+INSTALL_SCRIPT="$PROJECT_ROOT/install"
+[[ -f "$INSTALL_SCRIPT" ]] || INSTALL_SCRIPT="$PROJECT_ROOT/bin/install"
+IS_SOURCE_REPO=$([[ -f "$INSTALL_SCRIPT" ]] && echo true || echo false)
+TEST_DIR=""
+PASS=0
+FAIL=0
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+setup() {
+  TEST_DIR=$(mktemp -d)
+  mkdir -p "$TEST_DIR/backlog" "$TEST_DIR/.runs" "$TEST_DIR/agents" \
+    "$TEST_DIR/context" "$TEST_DIR/quality" "$TEST_DIR/quality/rubrics"
+
+  cat > "$TEST_DIR/backlog/TEST-001.md" <<'ITEM'
+---
+id: TEST-001
+title: Test item
+status: open
+priority: 1
+files:
+  - test-file.swift
+tags:
+  - concurrency
+depends-on: []
+---
+
+Test item for factory validation.
+ITEM
+
+  cat > "$TEST_DIR/backlog/TEST-002.md" <<'ITEM'
+---
+id: TEST-002
+title: Blocked item
+status: open
+priority: 2
+files:
+  - other-file.swift
+depends-on:
+  - TEST-001
+---
+
+Depends on TEST-001.
+ITEM
+
+  cat > "$TEST_DIR/backlog/TEST-003.md" <<'ITEM'
+---
+id: TEST-003
+title: Fixed item
+status: fixed
+priority: 1
+files:
+  - done-file.swift
+---
+
+Already done.
+ITEM
+}
+
+teardown() {
+  [[ -n "$TEST_DIR" ]] && rm -rf "$TEST_DIR"
+}
+
+assert_eq() {
+  local desc="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    echo "  PASS: $desc" >&2
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (expected '$expected', got '$actual')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local desc="$1" needle="$2" haystack="$3"
+  if echo "$haystack" | grep -q "$needle" 2>/dev/null; then
+    echo "  PASS: $desc" >&2
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (expected to contain '$needle')" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_exit() {
+  local desc="$1" expected="$2"
+  shift 2
+  "$@" >/dev/null 2>&1
+  local actual=$?
+  assert_eq "$desc" "$expected" "$actual"
+}
+
+# Generate a one-time commit token for a test project so the pre-commit hook allows the commit
+_gen_token() {
+  local project="$1"
+  [[ -f "$project/factory/factory.json" ]] || return 0
+  mkdir -p "$project/factory/.runs"
+  python3 -c "import secrets; print(secrets.token_hex(16))" > "$project/factory/.runs/.commit-token"
+}
+
+# Commit all changes in a test project, safely excluding runtime artifacts
+_test_commit() {
+  local project="$1" msg="$2"
+  _gen_token "$project"
+  git -C "$project" add -A 2>/dev/null
+  git -C "$project" reset HEAD -- factory/.runs/ 2>/dev/null || true
+  git -C "$project" commit -q -m "$msg" 2>/dev/null
+}
+
+test_db() {
+  echo ":: Testing db script" >&2
+  local db_path="$FACTORY_DIR/.telemetry.db"
+  local had_db=false
+  [[ -f "$db_path" ]] && had_db=true
+
+  "$FACTORY_DIR/db" init 2>/dev/null
+  assert_eq "db init creates file" "true" "$([[ -f "$db_path" ]] && echo true || echo false)"
+
+  local id
+  id=$("$FACTORY_DIR/db" insert-run \
+    "TEST-001" "builder" "impl" 1 "medium" "" "pass" \
+    "2026-01-01T00:00:00" "" "" "" 2>/dev/null)
+  assert_eq "db insert-run returns id" "true" "$([[ -n "$id" ]] && echo true || echo false)"
+
+  assert_eq "db query works" "true" "$([[ -n "$id" ]] && [[ "$id" -gt 0 ]] && echo true || echo false)"
+
+  sqlite3 "$db_path" "DELETE FROM gate_runs WHERE item_id='TEST-001';" 2>/dev/null
+  if [[ "$had_db" == "false" ]]; then
+    rm -f "$db_path"
+  fi
+}
+
+test_triage_frontmatter() {
+  echo ":: Testing frontmatter parsing" >&2
+
+  local id
+  id=$(sed -n '/^---$/,/^---$/p' "$TEST_DIR/backlog/TEST-001.md" | grep "^id:" | sed "s/^id: *//" | tr -d '"')
+  assert_eq "parse id" "TEST-001" "$id"
+
+  local status
+  status=$(sed -n '/^---$/,/^---$/p' "$TEST_DIR/backlog/TEST-001.md" | grep "^status:" | sed "s/^status: *//" | tr -d '"')
+  assert_eq "parse status" "open" "$status"
+
+  local files
+  files=$(sed -n '/^---$/,/^---$/p' "$TEST_DIR/backlog/TEST-001.md" | sed -n '/^files:$/,/^[^ ]/p' | grep '^ *- ' | sed 's/^ *- *//')
+  assert_eq "parse files" "test-file.swift" "$files"
+}
+
+test_script_syntax() {
+  echo ":: Testing script syntax" >&2
+  local scripts=(resolve gate complete run intake cancel score report triage track prereq validate sanitize-spec validate-behavior db merge-resolve install)
+
+  for s in "${scripts[@]}"; do
+    local full="$FACTORY_DIR/bin/$s"
+    [[ -f "$full" ]] || continue
+    if bash -n "$full" 2>/dev/null; then
+      PASS=$((PASS + 1))
+    else
+      echo "  FAIL: bin/$s has syntax errors" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+
+  local meta_scripts=(meta/test meta/contribute)
+  for s in "${meta_scripts[@]}"; do
+    local full="$FACTORY_DIR/$s"
+    [[ -f "$full" ]] || continue
+    if bash -n "$full" 2>/dev/null; then
+      PASS=$((PASS + 1))
+    else
+      echo "  FAIL: $s has syntax errors" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+  echo "  Checked $((${#scripts[@]} + ${#meta_scripts[@]})) scripts" >&2
+}
+
+test_script_permissions() {
+  echo ":: Testing script permissions" >&2
+  local scripts=(resolve gate complete run intake cancel score report triage track prereq validate sanitize-spec validate-behavior db merge-resolve install)
+
+  for s in "${scripts[@]}"; do
+    local full="$FACTORY_DIR/bin/$s"
+    [[ -f "$full" ]] || continue
+    if [[ -x "$full" ]]; then
+      PASS=$((PASS + 1))
+    else
+      echo "  FAIL: bin/$s not executable" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+
+  local meta_scripts=(meta/test meta/contribute)
+  for s in "${meta_scripts[@]}"; do
+    local full="$FACTORY_DIR/$s"
+    [[ -f "$full" ]] || continue
+    if [[ -x "$full" ]]; then
+      PASS=$((PASS + 1))
+    else
+      echo "  FAIL: $s not executable" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+}
+
+test_manifest() {
+  echo ":: Testing .factory-manifest" >&2
+
+  local manifest="$FACTORY_DIR/.factory-manifest"
+  assert_eq "manifest exists" "true" "$([[ -f "$manifest" ]] && echo true || echo false)"
+
+  local engine
+  engine=$(cat "$manifest")
+
+  local expected_scripts=(resolve gate complete run intake cancel score report triage track prereq validate sanitize-spec validate-behavior db merge-resolve)
+  for s in "${expected_scripts[@]}"; do
+    assert_contains "manifest has bin/$s" "^bin/${s}$" "$engine"
+  done
+
+  assert_contains "manifest has agents/" "^agents/" "$engine"
+  assert_contains "manifest has quality/" "^quality/" "$engine"
+  assert_contains "manifest has CLAUDE.md" "^CLAUDE.md$" "$engine"
+
+  assert_contains "manifest has scaffold backlog/" "^backlog/" "$engine"
+  assert_contains "manifest has scaffold context/" "^context/" "$engine"
+  assert_contains "manifest has scaffold tracking/" "^tracking/" "$engine"
+
+  local runtime_leaked=false
+  echo "$engine" | grep -q '\.runs' && runtime_leaked=true
+  echo "$engine" | grep -q '\.in-progress' && runtime_leaked=true
+  echo "$engine" | grep -q '\.telemetry' && runtime_leaked=true
+  assert_eq "no runtime files in manifest" "false" "$runtime_leaked"
+}
+
+test_factory_json() {
+  echo ":: Testing factory.json" >&2
+
+  local config="$FACTORY_DIR/factory/factory.json"
+  [[ -f "$config" ]] || config="$FACTORY_DIR/factory.json"
+  assert_eq "factory.json exists" "true" "$([[ -f "$config" ]] && echo true || echo false)"
+
+  local valid
+  valid=$(python3 -c "import json; json.load(open('$config')); print('yes')" 2>/dev/null || echo "no")
+  assert_eq "factory.json valid JSON" "yes" "$valid"
+
+  local has_version
+  has_version=$(python3 -c "import json; d=json.load(open('$config')); print('yes' if 'schema_version' in d else 'no')" 2>/dev/null || echo "no")
+  assert_eq "schema_version present" "yes" "$has_version"
+
+  local has_pipeline
+  has_pipeline=$(python3 -c "import json; d=json.load(open('$config')); print('yes' if 'pipeline' in d and 'stages' in d['pipeline'] else 'no')" 2>/dev/null || echo "no")
+  assert_eq "pipeline.stages present" "yes" "$has_pipeline"
+}
+
+test_install_templates() {
+  echo ":: Testing install templates" >&2
+
+  local templates="$FACTORY_DIR/../install-templates"
+  if [[ ! -d "$templates" ]]; then
+    echo "  SKIP: install-templates/ not present (target project)" >&2
+    return 0
+  fi
+  assert_eq "install-templates/ exists" "true" "true"
+
+  local langs=(swift python generic)
+  for lang in "${langs[@]}"; do
+    assert_eq "agents-${lang}/ exists" "true" "$([[ -d "$templates/agents-${lang}" ]] && echo true || echo false)"
+    assert_eq "quality-${lang}/ exists" "true" "$([[ -d "$templates/quality-${lang}" ]] && echo true || echo false)"
+    assert_eq "factory-${lang}.json exists" "true" "$([[ -f "$templates/factory-${lang}.json" ]] && echo true || echo false)"
+    local valid
+    valid=$(python3 -c "import json; json.load(open('$templates/factory-${lang}.json')); print('yes')" 2>/dev/null || echo "no")
+    assert_eq "factory-${lang}.json valid JSON" "yes" "$valid"
+  done
+
+  assert_eq "quality-common/ exists" "true" "$([[ -d "$templates/quality-common" ]] && echo true || echo false)"
+}
+
+test_install() {
+  echo ":: Testing install script" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install script not present (target project)" >&2
+    return 0
+  fi
+
+  local target
+  target=$(mktemp -d)
+  git -C "$target" init -q 2>/dev/null
+
+  local output
+  output=$("$INSTALL_SCRIPT" "$target" --language swift 2>&1)
+  assert_contains "install runs" "Installing factory" "$output"
+
+  assert_eq "factory/ dir created" "true" "$([[ -d "$target/factory" ]] && echo true || echo false)"
+
+  assert_eq "bin/ dir created" "true" "$([[ -d "$target/factory/bin" ]] && echo true || echo false)"
+  assert_eq "bin/resolve copied" "true" "$([[ -x "$target/factory/bin/resolve" ]] && echo true || echo false)"
+  assert_eq "bin/gate copied" "true" "$([[ -x "$target/factory/bin/gate" ]] && echo true || echo false)"
+  assert_eq "bin/complete copied" "true" "$([[ -x "$target/factory/bin/complete" ]] && echo true || echo false)"
+  assert_eq "resolve symlink" "true" "$([[ -L "$target/factory/resolve" ]] && echo true || echo false)"
+  assert_eq "gate symlink" "true" "$([[ -L "$target/factory/gate" ]] && echo true || echo false)"
+  assert_eq "complete symlink" "true" "$([[ -L "$target/factory/complete" ]] && echo true || echo false)"
+  assert_eq "resolve via symlink" "true" "$([[ -x "$target/factory/resolve" ]] && echo true || echo false)"
+
+  assert_eq "factory.json created" "true" "$([[ -f "$target/factory/factory.json" ]] && echo true || echo false)"
+  assert_eq "agents/ created" "true" "$([[ -d "$target/factory/agents" ]] && echo true || echo false)"
+  assert_eq "quality/ created" "true" "$([[ -d "$target/factory/quality" ]] && echo true || echo false)"
+
+  local swift_ext
+  swift_ext=$(python3 -c "import json; d=json.load(open('$target/factory/factory.json')); print(d['project']['file_extensions'][0])" 2>/dev/null || true)
+  assert_eq "swift factory.json has .swift" ".swift" "$swift_ext"
+
+  assert_eq "backlog/ scaffolded" "true" "$([[ -d "$target/factory/backlog" ]] && echo true || echo false)"
+  assert_eq "context/ scaffolded" "true" "$([[ -d "$target/factory/context" ]] && echo true || echo false)"
+  assert_eq "tracking/ scaffolded" "true" "$([[ -d "$target/factory/tracking" ]] && echo true || echo false)"
+
+  local tiers_in_json
+  tiers_in_json=$(python3 -c "import json; d=json.load(open('$target/factory/factory.json')); print('true' if d.get('gate',{}).get('tiers') else 'false')" 2>/dev/null || echo "false")
+  assert_eq "tiers in factory.json" "true" "$tiers_in_json"
+  assert_eq "CLAUDE.md created" "true" "$([[ -f "$target/CLAUDE.md" ]] && echo true || echo false)"
+  assert_contains "CLAUDE.md has factory section" "Factory" "$(cat "$target/CLAUDE.md")"
+
+  assert_eq ".upstream-sha exists" "true" "$([[ -f "$target/factory/.upstream-sha" ]] && echo true || echo false)"
+  assert_eq ".gitignore exists" "true" "$([[ -f "$target/factory/.gitignore" ]] && echo true || echo false)"
+
+  # Re-install should be refused
+  local output2
+  output2=$("$INSTALL_SCRIPT" "$target" --language swift 2>&1 || true)
+  assert_contains "re-install refused" "already exists" "$output2"
+
+  # Update should work and not touch factory.json
+  echo '{"modified":true}' > "$target/factory/factory.json"
+  local output3
+  output3=$("$INSTALL_SCRIPT" "$target" --update 2>&1)
+  assert_contains "update runs" "Updating engine" "$output3"
+  local still_modified
+  still_modified=$(grep -c 'modified' "$target/factory/factory.json" || true)
+  assert_eq "factory.json not overwritten by update" "1" "$still_modified"
+
+  rm -rf "$target"
+}
+
+test_get_config() {
+  echo ":: Testing get_config" >&2
+
+  local tmp
+  tmp=$(mktemp -d)
+  cat > "$tmp/factory.json" <<'JSON'
+{
+  "schema_version": 1,
+  "project": { "name": "test-app", "file_extensions": [".py", ".pyi"] },
+  "pipeline": { "stages": ["spec", "test", "impl"], "stage_agents": { "spec": "spec-writer" } },
+  "imports": { "pattern": "" },
+  "gate": { "layer2_checks": ["secrets"] }
+}
+JSON
+
+  _get_config() {
+    local key="$1" default="${2:-}"
+    local config="$tmp/factory.json"
+    [[ -f "$config" ]] || { echo "$default"; return; }
+    python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+  }
+
+  local val
+  val=$(_get_config "project.name")
+  assert_eq "get_config scalar" "test-app" "$val"
+
+  val=$(_get_config "project.file_extensions")
+  local line_count
+  line_count=$(echo "$val" | wc -l | tr -d ' ')
+  assert_eq "get_config list has 2 items" "2" "$line_count"
+  assert_contains "get_config list has .py" ".py" "$val"
+
+  val=$(_get_config "pipeline.stage_agents.spec")
+  assert_eq "get_config nested key" "spec-writer" "$val"
+
+  val=$(_get_config "nonexistent.key" "fallback")
+  assert_eq "get_config missing key uses default" "fallback" "$val"
+
+  val=$(_get_config "gate.layer2_checks")
+  assert_eq "get_config single-item list" "secrets" "$val"
+
+  rm -f "$tmp/factory.json"
+  val=$(_get_config "project.name" "default-val")
+  assert_eq "get_config missing file uses default" "default-val" "$val"
+
+  rm -rf "$tmp"
+}
+
+test_extract_imports() {
+  echo ":: Testing extract_imports" >&2
+
+  local tmp
+  tmp=$(mktemp -d)
+
+  cat > "$tmp/swift_file.swift" <<'SRC'
+import Foundation
+import SwiftUI
+import MapKit
+
+struct MyView: View { }
+SRC
+
+  cat > "$tmp/python_file.py" <<'SRC'
+import os
+from pathlib import Path
+import json
+x = 42
+SRC
+
+  _extract_imports() {
+    local file="$1" pattern="$2"
+    [[ -n "$pattern" ]] || return 0
+    python3 -c "
+import re
+pattern = r'$pattern'
+with open('$file') as f:
+  for line in f:
+    m = re.match(pattern, line.strip())
+    if m and m.group(1):
+      print(m.group(1))
+" 2>/dev/null || true
+  }
+
+  local result
+  result=$(_extract_imports "$tmp/swift_file.swift" '^import\s+(\S+)')
+  local count
+  count=$(echo "$result" | wc -l | tr -d ' ')
+  assert_eq "swift import count" "3" "$count"
+  assert_contains "swift imports Foundation" "Foundation" "$result"
+  assert_contains "swift imports SwiftUI" "SwiftUI" "$result"
+
+  result=$(_extract_imports "$tmp/python_file.py" '^(?:import|from)\s+(\S+)')
+  count=$(echo "$result" | wc -l | tr -d ' ')
+  assert_eq "python import count" "3" "$count"
+  assert_contains "python imports os" "os" "$result"
+  assert_contains "python imports pathlib" "pathlib" "$result"
+
+  result=$(_extract_imports "$tmp/swift_file.swift" '')
+  assert_eq "empty pattern returns nothing" "" "$result"
+
+  cat > "$tmp/no_imports.txt" <<'SRC'
+hello world
+no imports here
+SRC
+  result=$(_extract_imports "$tmp/no_imports.txt" '^import\s+(\S+)')
+  assert_eq "no matching lines returns nothing" "" "$result"
+
+  rm -rf "$tmp"
+}
+
+test_layer2_dispatch() {
+  echo ":: Testing layer2 dispatch" >&2
+
+  local tmp
+  tmp=$(mktemp -d)
+  git -C "$tmp" init -q 2>/dev/null
+  echo "test" > "$tmp/file.txt"
+  _test_commit "$tmp" "init"
+
+  local saved_factory_dir="$FACTORY_DIR"
+
+  local config_dir
+  config_dir=$(mktemp -d)
+  cat > "$config_dir/factory.json" <<'JSON'
+{
+  "schema_version": 1,
+  "project": { "file_extensions": [".txt"] },
+  "gate": { "layer2_checks": ["secrets"] }
+}
+JSON
+
+  # Test: gate script sources get_config from FACTORY_DIR, so we test via the script
+  # Verify unknown check name doesn't crash
+  cat > "$config_dir/factory2.json" <<'JSON'
+{
+  "schema_version": 1,
+  "project": { "file_extensions": [".txt"] },
+  "gate": { "layer2_checks": ["nonexistent_check", "secrets"] }
+}
+JSON
+
+  local output
+  # Call gate's get_config inline to test dispatch logic
+  output=$(
+    FACTORY_DIR="$config_dir"
+    get_config() {
+      local key="$1" default="${2:-}"
+      local config="$FACTORY_DIR/factory2.json"
+      [[ -f "$config" ]] || { echo "$default"; return; }
+      python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+    }
+    layer2_secrets() { return 0; }
+    run_layer2() {
+      local item_id="$1" worktree="$2"
+      local failed=false
+      local checks
+      checks=$(get_config "gate.layer2_checks")
+      [[ -n "$checks" ]] || { echo "PASS"; return; }
+      while IFS= read -r check_name; do
+        [[ -n "$check_name" ]] || continue
+        local func_name="layer2_${check_name}"
+        if declare -f "$func_name" > /dev/null 2>&1; then
+          if ! "$func_name" "$item_id" "$worktree"; then
+            failed=true
+          fi
+        else
+          echo "WARN: unknown check '$check_name'" >&2
+        fi
+      done <<< "$checks"
+      [[ "$failed" == "false" ]] && echo "PASS" || echo "FAIL"
+    }
+    run_layer2 "TEST" "$tmp" 2>&1
+  )
+  assert_contains "unknown check warns" "unknown check" "$output"
+  assert_contains "dispatch still passes" "PASS" "$output"
+
+  # Test: empty checks list
+  cat > "$config_dir/factory3.json" <<'JSON'
+{
+  "schema_version": 1,
+  "gate": { "layer2_checks": [] }
+}
+JSON
+  output=$(
+    FACTORY_DIR="$config_dir"
+    get_config() {
+      local key="$1" default="${2:-}"
+      local config="$FACTORY_DIR/factory3.json"
+      [[ -f "$config" ]] || { echo "$default"; return; }
+      python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+    }
+    run_layer2() {
+      local checks
+      checks=$(get_config "gate.layer2_checks")
+      [[ -n "$checks" ]] || { echo "PASS"; return; }
+      echo "FAIL"
+    }
+    run_layer2
+  )
+  assert_eq "empty checks returns PASS" "PASS" "$output"
+
+  rm -rf "$tmp" "$config_dir"
+}
+
+test_copy_templates() {
+  echo ":: Testing copy_templates" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  local target
+  target=$(mktemp -d)
+  git -C "$target" init -q 2>/dev/null
+
+  "$INSTALL_SCRIPT" "$target" --language python >/dev/null 2>&1
+  local agent_count
+  agent_count=$(ls "$target/factory/agents/"*.md 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "python install has 10 agents" "10" "$agent_count"
+  assert_eq "python has clarifier" "true" "$([[ -f "$target/factory/agents/clarifier.md" ]] && echo true || echo false)"
+  assert_eq "python has decomposer" "true" "$([[ -f "$target/factory/agents/decomposer.md" ]] && echo true || echo false)"
+  assert_eq "python has auditor" "true" "$([[ -f "$target/factory/agents/auditor.md" ]] && echo true || echo false)"
+  rm -rf "$target"
+
+  target=$(mktemp -d)
+  git -C "$target" init -q 2>/dev/null
+  "$INSTALL_SCRIPT" "$target" --language swift >/dev/null 2>&1
+  agent_count=$(ls "$target/factory/agents/"*.md 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "swift install has 12 agents" "12" "$agent_count"
+  rm -rf "$target"
+
+  target=$(mktemp -d)
+  git -C "$target" init -q 2>/dev/null
+  "$INSTALL_SCRIPT" "$target" --language generic >/dev/null 2>&1
+
+  local rubrics_exist
+  rubrics_exist=$([[ -d "$target/factory/quality/rubrics" ]] && echo true || echo false)
+  assert_eq "quality-common rubrics merged" "true" "$rubrics_exist"
+  rm -rf "$target"
+}
+
+test_contribute() {
+  echo ":: Testing contribute script" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  local upstream target
+  upstream=$(mktemp -d)
+  target=$(mktemp -d)
+
+  git -C "$upstream" init -q 2>/dev/null
+  cp "$FACTORY_DIR/.factory-manifest" "$upstream/"
+  mkdir -p "$upstream/bin"
+  cp "$FACTORY_DIR/bin/resolve" "$upstream/bin/"
+  cp "$FACTORY_DIR/bin/gate" "$upstream/bin/"
+  _test_commit "$upstream" "init"
+
+  git -C "$target" init -q 2>/dev/null
+  "$INSTALL_SCRIPT" "$target" --language generic >/dev/null 2>&1
+
+  echo "# local change" >> "$target/factory/bin/gate"
+  local output
+  output=$("$target/factory/meta/contribute" "$upstream" 2>&1 || true)
+  assert_contains "contribute runs" "Comparing\|CHANGED\|Patch" "$output"
+
+  rm -rf "$upstream" "$target"
+}
+
+test_validate_behavior() {
+  echo ":: Testing validate-behavior" >&2
+
+  local test_behavior="$TEST_DIR/behavior.md"
+  cat > "$test_behavior" <<'BEH'
+## Purpose
+Test behavior
+
+## Data Model
+None
+
+## Behaviors
+
+### Lifecycle
+1. App starts
+
+### Data
+2. Data loads
+
+### Interaction
+3. User taps
+
+### Display
+4. Map shows
+
+### Navigation
+5. Tab switches
+
+### Error
+6. Error shows
+
+## Cross-Feature Dependencies
+None
+
+## Source Behaviors
+1. Original behavior [carry]
+BEH
+
+  local output
+  output=$("$FACTORY_DIR/validate-behavior" "$test_behavior" 2>&1 || true)
+  assert_contains "validate-behavior runs" "Validating" "$output"
+}
+
+test_resolve_integration() {
+  echo ":: Testing resolve integration (end-to-end)" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  # Clean up stale worktrees from previous interrupted runs
+  for stale_dir in /tmp/INT-001 /tmp/INT-002 /tmp/INT-003 /tmp/INT-004; do
+    [[ -d "$stale_dir" ]] && rm -rf "$stale_dir"
+  done
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "# test project" > "$project/README.md"
+  mkdir -p "$project/src"
+  echo "print('hello')" > "$project/src/main.py"
+  _test_commit "$project" "init"
+
+  "$INSTALL_SCRIPT" "$project" --language python >/dev/null 2>&1
+  _test_commit "$project" "add factory"
+
+  cat > "$project/factory/context/atomicity.json" <<'JSON'
+{
+  "groups": [
+    {"name": "core", "paths": ["src/main.py"], "reason": "test group"}
+  ]
+}
+JSON
+
+  cat > "$project/factory/context/module-map.json" <<'JSON'
+{
+  "modules": {
+    "core": {
+      "keywords": ["pipeline", "main"],
+      "context_file": "docs/core.md"
+    }
+  }
+}
+JSON
+
+  # Backlog item WITHOUT agent: field (tests get_field empty fallback)
+  cat > "$project/factory/backlog/INT-001.md" <<'ITEM'
+---
+id: INT-001
+title: Test pipeline integration
+status: open
+priority: 1
+stage: impl
+files:
+  - src/main.py
+tags:
+  - pipeline
+depends-on: []
+---
+
+Integration test item. No agent field - should fall back to stage_agents.
+ITEM
+
+  _test_commit "$project" "add test item"
+
+  local output exit_code
+  output=$("$project/factory/resolve" INT-001 2>&1) && exit_code=0 || exit_code=$?
+
+  assert_eq "resolve exits 0" "0" "$exit_code"
+  assert_contains "prompt has START marker" "PROMPT-START" "$output"
+  assert_contains "prompt has END marker" "PROMPT-END" "$output"
+  assert_contains "prompt has agent definition" "Agent Definition" "$output"
+  assert_contains "prompt has task section" "## Item: INT-001" "$output"
+
+  local worktree_path="/tmp/INT-001"
+  assert_eq "worktree created" "true" "$([[ -d "$worktree_path" ]] && echo true || echo false)"
+
+  local ip_content
+  ip_content=$(cat "$project/factory/.in-progress" 2>/dev/null || true)
+  assert_contains "in-progress updated" "INT-001" "$ip_content"
+
+  # Clean up: remove worktree, in-progress, branch
+  git -C "$project" worktree remove --force "$worktree_path" 2>/dev/null || true
+  git -C "$project" branch -D "fix/INT-001" 2>/dev/null || true
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+
+  # Test 2: resolve with empty module-map (no modules at all)
+  cat > "$project/factory/context/module-map.json" <<'JSON'
+{
+  "modules": {}
+}
+JSON
+
+  cat > "$project/factory/backlog/INT-002.md" <<'ITEM'
+---
+id: INT-002
+title: Empty modules test
+status: open
+priority: 1
+files:
+  - src/main.py
+depends-on: []
+---
+
+Test with empty module map.
+ITEM
+
+  _test_commit "$project" "add INT-002"
+
+  output=$("$project/factory/resolve" INT-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "resolve with empty modules exits 0" "0" "$exit_code"
+  assert_contains "empty modules still emits prompt" "PROMPT-START" "$output"
+
+  git -C "$project" worktree remove --force "/tmp/INT-002" 2>/dev/null || true
+  git -C "$project" branch -D "fix/INT-002" 2>/dev/null || true
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+
+  # Test 3: get_body handles frontmatter correctly (BSD sed fix)
+  local body
+  body=$(
+    get_body_test() {
+      local file="$1"
+      sed -n '/^---$/,/^---$/!p' "$file" | sed '1{/^$/d;}'
+    }
+    get_body_test "$project/factory/backlog/INT-002.md"
+  )
+  assert_contains "get_body extracts body" "Test with empty module map" "$body"
+
+  # Test 4: resolve a second item while first is not in-progress (no overlap conflict)
+  cat > "$project/factory/backlog/INT-003.md" <<'ITEM'
+---
+id: INT-003
+title: Non-overlapping files test
+status: open
+priority: 1
+files:
+  - src/other.py
+depends-on: []
+---
+
+Different files from INT-002, no overlap.
+ITEM
+
+  _test_commit "$project" "add INT-003"
+
+  output=$("$project/factory/resolve" INT-003 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "non-overlapping resolve exits 0" "0" "$exit_code"
+
+  git -C "$project" worktree remove --force "/tmp/INT-003" 2>/dev/null || true
+  git -C "$project" branch -D "fix/INT-003" 2>/dev/null || true
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+
+  rm -rf "$project"
+
+  # Test 5: resolve works with master branch (not main)
+  local master_project
+  master_project=$(mktemp -d)
+  git -C "$master_project" init -q -b master 2>/dev/null
+  echo "# test" > "$master_project/README.md"
+  mkdir -p "$master_project/src"
+  echo "print('hello')" > "$master_project/src/app.py"
+  _test_commit "$master_project" "init"
+
+  "$INSTALL_SCRIPT" "$master_project" --language python >/dev/null 2>&1
+  _test_commit "$master_project" "add factory"
+
+  cat > "$master_project/factory/backlog/INT-004.md" <<'ITEM'
+---
+id: INT-004
+title: Master branch test
+status: open
+priority: 1
+files:
+  - src/app.py
+depends-on: []
+---
+
+Test resolve on a repo with master branch.
+ITEM
+
+  _test_commit "$master_project" "add item"
+
+  output=$("$master_project/factory/resolve" INT-004 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "resolve on master branch exits 0" "0" "$exit_code"
+  assert_contains "master branch prompt emitted" "PROMPT-START" "$output"
+  assert_eq "master branch worktree created" "true" "$([[ -d /tmp/INT-004 ]] && echo true || echo false)"
+
+  git -C "$master_project" worktree remove --force "/tmp/INT-004" 2>/dev/null || true
+  git -C "$master_project" branch -D "fix/INT-004" 2>/dev/null || true
+  rm -rf "$master_project"
+}
+
+test_gate_checks() {
+  echo ":: Testing gate_checks telemetry (FM-029)" >&2
+  local db_path="$FACTORY_DIR/.telemetry.db"
+  local had_db=false
+  [[ -f "$db_path" ]] && had_db=true
+
+  "$FACTORY_DIR/db" init 2>/dev/null
+
+  # verify gate_checks table exists
+  local tables
+  tables=$(sqlite3 "$db_path" ".tables" 2>/dev/null)
+  assert_contains "gate_checks table exists" "gate_checks" "$tables"
+
+  # verify schema columns
+  local schema
+  schema=$(sqlite3 "$db_path" "PRAGMA table_info(gate_checks);" 2>/dev/null)
+  assert_contains "gate_checks has run_id column" "run_id" "$schema"
+  assert_contains "gate_checks has layer column" "layer" "$schema"
+  assert_contains "gate_checks has check_name column" "check_name" "$schema"
+  assert_contains "gate_checks has outcome column" "outcome" "$schema"
+  assert_contains "gate_checks has detail column" "detail" "$schema"
+
+  # insert a run to get a valid run_id
+  local run_id
+  run_id=$("$FACTORY_DIR/db" insert-run \
+    "TEST-CHK" "builder" "impl" 1 "medium" "" "pass" \
+    "2026-01-01T00:00:00" "" "" "" 2>/dev/null)
+  assert_eq "insert-run for checks test" "true" "$([[ -n "$run_id" ]] && echo true || echo false)"
+
+  # insert-check: pass outcome
+  "$FACTORY_DIR/db" insert-check "$run_id" 1 "scope_check" "pass" 2>/dev/null
+  local pass_count
+  pass_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND check_name='scope_check' AND outcome='pass';" 2>/dev/null)
+  assert_eq "insert-check pass" "1" "$pass_count"
+
+  # insert-check: fail outcome
+  "$FACTORY_DIR/db" insert-check "$run_id" 1 "build" "fail" 2>/dev/null
+  local fail_count
+  fail_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND check_name='build' AND outcome='fail';" 2>/dev/null)
+  assert_eq "insert-check fail" "1" "$fail_count"
+
+  # insert-check: skip outcome with detail
+  "$FACTORY_DIR/db" insert-check "$run_id" 2 "mainactor" "skip" "unknown check function" 2>/dev/null
+  local skip_detail
+  skip_detail=$(sqlite3 "$db_path" "SELECT detail FROM gate_checks WHERE run_id=$run_id AND check_name='mainactor' AND outcome='skip';" 2>/dev/null)
+  assert_eq "insert-check skip with detail" "unknown check function" "$skip_detail"
+
+  # insert-check: warn outcome
+  "$FACTORY_DIR/db" insert-check "$run_id" 3 "evaluator" "warn" "human review required" 2>/dev/null
+  local warn_count
+  warn_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND check_name='evaluator' AND outcome='warn';" 2>/dev/null)
+  assert_eq "insert-check warn" "1" "$warn_count"
+
+  # insert-check: null detail when omitted
+  "$FACTORY_DIR/db" insert-check "$run_id" 1 "lint" "pass" 2>/dev/null
+  local null_detail
+  null_detail=$(sqlite3 "$db_path" "SELECT COALESCE(detail, 'NULL') FROM gate_checks WHERE run_id=$run_id AND check_name='lint';" 2>/dev/null)
+  assert_eq "insert-check null detail" "NULL" "$null_detail"
+
+  # layer constraint: only 1, 2, 3
+  local bad_layer_result
+  bad_layer_result=$("$FACTORY_DIR/db" insert-check "$run_id" 4 "bad" "pass" 2>&1 || true)
+  local bad_layer_count
+  bad_layer_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND check_name='bad';" 2>/dev/null)
+  assert_eq "insert-check rejects layer 4" "0" "$bad_layer_count"
+
+  # outcome constraint: only pass, fail, skip, warn
+  local bad_outcome_result
+  bad_outcome_result=$("$FACTORY_DIR/db" insert-check "$run_id" 1 "bad2" "crash" 2>&1 || true)
+  local bad_outcome_count
+  bad_outcome_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND check_name='bad2';" 2>/dev/null)
+  assert_eq "insert-check rejects invalid outcome" "0" "$bad_outcome_count"
+
+  # verify all valid checks were recorded
+  local total
+  total=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id;" 2>/dev/null)
+  assert_eq "total checks recorded" "5" "$total"
+
+  # verify layer filter works
+  local l1_count
+  l1_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND layer=1;" 2>/dev/null)
+  assert_eq "layer 1 checks count" "3" "$l1_count"
+
+  local l2_count
+  l2_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND layer=2;" 2>/dev/null)
+  assert_eq "layer 2 checks count" "1" "$l2_count"
+
+  local l3_count
+  l3_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM gate_checks WHERE run_id=$run_id AND layer=3;" 2>/dev/null)
+  assert_eq "layer 3 checks count" "1" "$l3_count"
+
+  # report checks subcommand
+  local report_output
+  report_output=$("$FACTORY_DIR/report" checks 2>/dev/null || true)
+  assert_contains "report checks shows check_name" "scope_check" "$report_output"
+  assert_contains "report checks shows layer" "1" "$report_output"
+
+  # report all includes checks section
+  local report_all
+  report_all=$("$FACTORY_DIR/report" all 2>/dev/null || true)
+  assert_contains "report all includes checks" "Per-Check" "$report_all"
+
+  # cleanup
+  sqlite3 "$db_path" "DELETE FROM gate_checks WHERE run_id=$run_id;" 2>/dev/null
+  sqlite3 "$db_path" "DELETE FROM gate_runs WHERE item_id='TEST-CHK';" 2>/dev/null
+  if [[ "$had_db" == "false" ]]; then
+    rm -f "$db_path"
+  fi
+}
+
+test_test_coverage() {
+  echo ":: Testing layer1_test_coverage (FM-030)" >&2
+
+  local project
+  project=$(mktemp -d)
+  mkdir -p "$project/src/foo" "$project/tests/foo"
+
+  cat > "$project/factory.json" <<'CONF'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "pipeline": { "stages": ["spec", "test", "impl"], "skip_stages": [], "stage_agents": {} },
+  "testing": { "source_dirs": ["src/"], "test_dirs": ["tests/"], "test_prefix": "test_", "test_suffix": "" }
+}
+CONF
+
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "init" > "$project/README.md"
+  _test_commit "$project" "init"
+
+  # Helper script that loads gate functions without running main
+  local helper="$project/_test_helper.sh"
+  cat > "$helper" <<HELPER
+#!/usr/bin/env bash
+set +euo pipefail
+FACTORY_DIR="$project"
+PROJECT_ROOT="$project"
+DEFAULT_BRANCH="\${1}"
+record_rejection() { :; }
+get_run_field() { echo ""; }
+$(sed -n '/^get_config()/,/^}/p' "$FACTORY_DIR/gate")
+$(sed -n '/^layer1_test_coverage()/,/^}/p' "$FACTORY_DIR/gate")
+layer1_test_coverage "TEST" "$project" 2>/dev/null && echo "pass" || echo "fail"
+HELPER
+  chmod +x "$helper"
+
+  # Source with test - should pass
+  echo "def foo(): pass" > "$project/src/foo/bar.py"
+  echo "def test_bar(): pass" > "$project/tests/foo/test_bar.py"
+  _test_commit "$project" "add bar with test"
+
+  local result
+  result=$(bash "$helper" "main~1")
+  assert_eq "test_coverage: source with test passes" "pass" "$result"
+
+  # Source without test - should fail
+  echo "def baz(): pass" > "$project/src/foo/baz.py"
+  _test_commit "$project" "add baz without test"
+
+  result=$(bash "$helper" "main~2")
+  assert_eq "test_coverage: source without test fails" "fail" "$result"
+
+  # No testing config - should skip (pass)
+  cat > "$project/factory.json" <<'CONF2'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF2
+  result=$(bash "$helper" "main~2")
+  assert_eq "test_coverage: no testing config skips" "pass" "$result"
+
+  # Non-source dir file - should skip (pass)
+  cat > "$project/factory.json" <<'CONF3'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "pipeline": { "stages": ["spec", "test", "impl"], "skip_stages": [], "stage_agents": {} },
+  "testing": { "source_dirs": ["src/"], "test_dirs": ["tests/"], "test_prefix": "test_", "test_suffix": "" }
+}
+CONF3
+  mkdir -p "$project/docs"
+  echo "notes" > "$project/docs/notes.py"
+  _test_commit "$project" "add non-source file"
+
+  result=$(bash "$helper" "main~1")
+  assert_eq "test_coverage: non-source dir file skips" "pass" "$result"
+
+  rm -rf "$project"
+}
+
+test_test_fallback() {
+  echo ":: Testing layer1_test fallback to commands.test (FM-030)" >&2
+
+  local project
+  project=$(mktemp -d)
+
+  local helper="$project/_test_helper.sh"
+
+  # commands.test that succeeds
+  cat > "$project/factory.json" <<'CONF'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": { "test": "true" },
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF
+
+  cat > "$helper" <<HELPER
+#!/usr/bin/env bash
+set +euo pipefail
+FACTORY_DIR="$project"
+$(sed -n '/^get_config()/,/^}/p' "$FACTORY_DIR/gate")
+$(sed -n '/^layer1_test()/,/^}/p' "$FACTORY_DIR/gate")
+layer1_test "$project" 2>/dev/null && echo "pass" || echo "fail"
+HELPER
+
+  local result
+  result=$(bash "$helper")
+  assert_eq "test_fallback: commands.test success" "pass" "$result"
+
+  # commands.test that fails
+  cat > "$project/factory.json" <<'CONF2'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": { "test": "false" },
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF2
+  result=$(bash "$helper")
+  assert_eq "test_fallback: commands.test failure" "fail" "$result"
+
+  # No commands.test, no validate - should skip
+  cat > "$project/factory.json" <<'CONF3'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF3
+  result=$(bash "$helper")
+  assert_eq "test_fallback: no test config skips" "pass" "$result"
+
+  rm -rf "$project"
+}
+
+test_acceptance() {
+  echo ":: Testing end-to-end acceptance (full lifecycle)" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  # Clean up stale worktrees from previous interrupted runs
+  for stale_dir in /tmp/ACC-001 /tmp/ACC-002; do
+    [[ -d "$stale_dir" ]] && rm -rf "$stale_dir"
+  done
+
+  local project
+  project=$(mktemp -d)
+
+  # Helper: clean up worktrees, branches, and runtime state for an item
+  acc_cleanup_item() {
+    local p="$1" id="$2"
+    git -C "$p" worktree remove --force "/tmp/${id}" 2>/dev/null || true
+    git -C "$p" branch -D "fix/${id}" 2>/dev/null || true
+    rm -f "$p/factory/.in-progress"
+    rm -rf "$p/factory/.runs"
+    rm -rf "$p/factory/.resolve.lock"
+    rm -rf "$p/factory/.merge.lock"
+  }
+
+  # ======== Part 1: Full lifecycle (resolve -> gate -> complete) ========
+  echo "  -- Part 1: Full lifecycle" >&2
+
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "# acceptance test project" > "$project/README.md"
+  mkdir -p "$project/src"
+  echo "print('hello')" > "$project/src/main.py"
+  _test_commit "$project" "init"
+
+  "$INSTALL_SCRIPT" "$project" --language python >/dev/null 2>&1
+
+  # Override test/lint commands so they pass without pytest/ruff
+  python3 -c "
+import json
+f = '$project/factory/factory.json'
+with open(f) as fh:
+    d = json.load(fh)
+d['commands']['test'] = ''
+d['commands']['lint'] = ''
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+"
+
+  _test_commit "$project" "add factory"
+
+  cat > "$project/factory/backlog/ACC-001.md" <<'ITEM'
+---
+id: ACC-001
+title: Acceptance test item
+status: open
+priority: 1
+files:
+  - src/main.py
+depends-on: []
+---
+
+Full lifecycle acceptance test.
+ITEM
+
+  _test_commit "$project" "add ACC-001"
+
+  # Resolve
+  local output exit_code
+  output=$("$project/factory/resolve" ACC-001 2>&1) && exit_code=0 || exit_code=$?
+
+  assert_eq "p1: resolve exits 0" "0" "$exit_code"
+  assert_eq "p1: worktree created" "true" "$([[ -d /tmp/ACC-001 ]] && echo true || echo false)"
+  assert_contains "p1: prompt has PROMPT-START" "PROMPT-START" "$output"
+
+  # Make a trivial change in the worktree and commit
+  echo "# acceptance test change" >> /tmp/ACC-001/src/main.py
+  _test_commit /tmp/ACC-001 "impl(ACC-001): test change"
+
+  # Gate
+  output=$("$project/factory/gate" ACC-001 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p1: gate exits 0" "0" "$exit_code"
+
+  # Complete
+  output=$("$project/factory/complete" ACC-001 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p1: complete exits 0" "0" "$exit_code"
+
+  # Verify status changed to fixed
+  local status_after
+  status_after=$(sed -n '/^---$/,/^---$/p' "$project/factory/backlog/ACC-001.md" | grep "^status:" | sed "s/^status: *//" | tr -d '"')
+  assert_eq "p1: status is fixed" "fixed" "$status_after"
+
+  # Verify worktree cleaned up
+  assert_eq "p1: worktree removed" "false" "$([[ -d /tmp/ACC-001 ]] && echo true || echo false)"
+
+  # Verify branch deleted
+  local branch_exists
+  branch_exists=$(git -C "$project" branch --list "fix/ACC-001" 2>/dev/null)
+  assert_eq "p1: branch deleted" "" "$branch_exists"
+
+  # ======== Part 2: Approval flow (gate exit 3 -> approve -> apply -> re-gate) ========
+  echo "  -- Part 2: Approval flow" >&2
+
+  # Clean any leftover state
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+  rm -rf "$project/factory/.merge.lock"
+
+  cat > "$project/factory/backlog/ACC-002.md" <<'ITEM'
+---
+id: ACC-002
+title: Approval flow test
+status: open
+priority: 1
+files:
+  - src/main.py
+  - pyproject.toml
+depends-on: []
+---
+
+Test the dependency approval flow.
+ITEM
+
+  # Write imports/packages config into factory.json (FM-064: consolidated config)
+  python3 -c "
+import json
+f = '$project/factory/factory.json'
+with open(f) as fh:
+    d = json.load(fh)
+d['imports']['allowed'] = {'domain': {'allowed': ['os', 'sys', 'json'], 'banned': []}}
+d['packages']['allowed'] = []
+d['packages']['review_required'] = []
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+"
+
+  # Create a minimal pyproject.toml on the main branch (no deps yet)
+  cat > "$project/pyproject.toml" <<'TOML'
+[project]
+name = "acc-test"
+version = "0.1.0"
+dependencies = []
+TOML
+
+  _test_commit "$project" "add ACC-002 and quality files"
+
+  # Resolve ACC-002
+  output=$("$project/factory/resolve" ACC-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p2: resolve exits 0" "0" "$exit_code"
+
+  # In the worktree, add a new import and a new package dependency
+  echo 'import requests' >> /tmp/ACC-002/src/main.py
+
+  cat > /tmp/ACC-002/pyproject.toml <<'TOML'
+[project]
+name = "acc-test"
+version = "0.1.0"
+dependencies = [
+    "requests>=2.0",
+]
+TOML
+
+  _test_commit /tmp/ACC-002 "impl(ACC-002): add requests dependency"
+
+  # Gate should exit 3 (needs_approval)
+  output=$("$project/factory/gate" ACC-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p2: gate exits 3 (needs_approval)" "3" "$exit_code"
+
+  # Verify pending-approvals.json exists and contains "requests"
+  local approvals_path="$project/factory/.runs/ACC-002.pending-approvals.json"
+  assert_eq "p2: pending-approvals exists" "true" "$([[ -f "$approvals_path" ]] && echo true || echo false)"
+
+  local approvals_content
+  approvals_content=$(cat "$approvals_path" 2>/dev/null || echo "")
+  assert_contains "p2: approvals has requests import" "requests" "$approvals_content"
+
+  # Check both imports and packages sections have entries
+  local has_import_entry has_package_entry
+  has_import_entry=$(python3 -c "
+import json
+d = json.load(open('$approvals_path'))
+print('yes' if any(i.get('name') == 'requests' for i in d.get('imports', [])) else 'no')
+" 2>/dev/null || echo "no")
+  assert_eq "p2: imports section has requests" "yes" "$has_import_entry"
+
+  has_package_entry=$(python3 -c "
+import json
+d = json.load(open('$approvals_path'))
+print('yes' if any(p.get('name') == 'requests' for p in d.get('packages', [])) else 'no')
+" 2>/dev/null || echo "no")
+  assert_eq "p2: packages section has requests" "yes" "$has_package_entry"
+
+  # Write approval decisions
+  cat > "$project/factory/.runs/ACC-002.approval-decisions.json" <<'JSON'
+{
+  "imports": [
+    {"name": "requests", "layer": "domain", "approved": true, "reason": "test"}
+  ],
+  "packages": [
+    {"name": "requests", "approved": true, "reason": "test"}
+  ]
+}
+JSON
+
+  # Run approve --apply
+  output=$("$project/factory/approve" --apply ACC-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p2: approve --apply exits 0" "0" "$exit_code"
+
+  # Verify factory.json imports.allowed now contains "requests"
+  local imports_has_requests
+  imports_has_requests=$(python3 -c "
+import json
+d = json.load(open('$project/factory/factory.json'))
+allowed = d.get('imports', {}).get('allowed', {}).get('domain', {}).get('allowed', [])
+print('yes' if 'requests' in allowed else 'no')
+" 2>/dev/null || echo "no")
+  assert_eq "p2: allowed-imports has requests" "yes" "$imports_has_requests"
+
+  # Verify factory.json packages.allowed now contains "requests"
+  local packages_has_requests
+  packages_has_requests=$(python3 -c "
+import json
+d = json.load(open('$project/factory/factory.json'))
+allowed = [p['name'] if isinstance(p, dict) else p for p in d.get('packages', {}).get('allowed', [])]
+print('yes' if 'requests' in allowed else 'no')
+" 2>/dev/null || echo "no")
+  assert_eq "p2: allowed-packages has requests" "yes" "$packages_has_requests"
+
+  # Re-run gate - should pass now
+  output=$("$project/factory/gate" ACC-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p2: re-gate exits 0 after approval" "0" "$exit_code"
+
+  # Complete ACC-002
+  output=$("$project/factory/complete" ACC-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p2: complete exits 0" "0" "$exit_code"
+
+  # Verify status changed to fixed
+  status_after=$(sed -n '/^---$/,/^---$/p' "$project/factory/backlog/ACC-002.md" | grep "^status:" | sed "s/^status: *//" | tr -d '"')
+  assert_eq "p2: status is fixed" "fixed" "$status_after"
+
+  # Clean up any remaining state
+  acc_cleanup_item "$project" "ACC-002"
+
+  # ======== Part 3: Update preserves config ========
+  echo "  -- Part 3: Update preserves config" >&2
+
+  # Add a custom field to factory.json
+  python3 -c "
+import json
+f = '$project/factory/factory.json'
+with open(f) as fh:
+    d = json.load(fh)
+d['custom_acceptance_field'] = 'preserved_value'
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+"
+  _test_commit "$project" "add custom field"
+
+  # Run update
+  output=$("$INSTALL_SCRIPT" "$project" --update 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "p3: update exits 0" "0" "$exit_code"
+
+  # Verify custom field is preserved
+  local custom_field
+  custom_field=$(python3 -c "
+import json
+d = json.load(open('$project/factory/factory.json'))
+print(d.get('custom_acceptance_field', ''))
+" 2>/dev/null || echo "")
+  assert_eq "p3: custom field preserved" "preserved_value" "$custom_field"
+
+  # Verify engine scripts in bin/ and symlinks
+  assert_eq "p3: bin/resolve present" "true" "$([[ -x "$project/factory/bin/resolve" ]] && echo true || echo false)"
+  assert_eq "p3: bin/gate present" "true" "$([[ -x "$project/factory/bin/gate" ]] && echo true || echo false)"
+  assert_eq "p3: bin/complete present" "true" "$([[ -x "$project/factory/bin/complete" ]] && echo true || echo false)"
+  assert_eq "p3: resolve symlink works" "true" "$([[ -x "$project/factory/resolve" ]] && echo true || echo false)"
+
+  # ======== Cleanup ========
+  rm -rf "$project"
+}
+
+# Test: get_imports_data falls back to legacy file when factory.json has empty lists (FM-072)
+test_imports_fallback() {
+  echo ":: Testing get_imports_data empty-list fallback (FM-072)" >&2
+
+  local project
+  project=$(mktemp -d)
+  mkdir -p "$project/quality"
+
+  local helper="$project/_test_helper.sh"
+
+  # Case 1: factory.json has empty allowed lists - should fall back to legacy file
+  cat > "$project/factory.json" <<'CONF'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "imports": {
+    "pattern": "^import\\s+(\\S+)",
+    "allowed": {
+      "domain": { "allowed": [], "banned": [] }
+    }
+  },
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF
+
+  cat > "$project/quality/allowed-imports.json" <<'LEGACY'
+{"domain": {"allowed": ["json", "os"], "banned": []}}
+LEGACY
+
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set +euo pipefail'
+    echo "FACTORY_DIR=\"$project\""
+    echo "IMPORTS_FILE=\"$project/quality/allowed-imports.json\""
+    sed -n '/^get_config()/,/^}/p' "$FACTORY_DIR/gate"
+    sed -n '/^get_imports_data()/,/^}/p' "$FACTORY_DIR/gate"
+    echo 'get_imports_data'
+  } > "$helper"
+
+  local result
+  result=$(bash "$helper")
+  local has_os
+  has_os=$(echo "$result" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+print('yes' if 'os' in data.get('domain', {}).get('allowed', []) else 'no')
+" 2>/dev/null)
+  assert_eq "imports_fallback: empty config falls back to legacy" "yes" "$has_os"
+
+  # Case 2: factory.json has non-empty allowed lists - should use factory.json
+  cat > "$project/factory.json" <<'CONF2'
+{
+  "schema_version": 1,
+  "project": { "name": "test-proj", "file_extensions": [".py"] },
+  "commands": {},
+  "imports": {
+    "pattern": "^import\\s+(\\S+)",
+    "allowed": {
+      "domain": { "allowed": ["pathlib", "sys"], "banned": [] }
+    }
+  },
+  "pipeline": { "stages": ["spec", "impl"], "skip_stages": [], "stage_agents": {} }
+}
+CONF2
+
+  result=$(bash "$helper")
+  local has_pathlib
+  has_pathlib=$(echo "$result" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+print('yes' if 'pathlib' in data.get('domain', {}).get('allowed', []) else 'no')
+" 2>/dev/null)
+  assert_eq "imports_fallback: non-empty config takes precedence" "yes" "$has_pathlib"
+
+  local has_os_from_legacy
+  has_os_from_legacy=$(echo "$result" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+print('yes' if 'os' in data.get('domain', {}).get('allowed', []) else 'no')
+" 2>/dev/null)
+  assert_eq "imports_fallback: non-empty config ignores legacy" "no" "$has_os_from_legacy"
+
+  rm -rf "$project"
+}
+
+# End-to-end test: complete preserves branch on merge conflict (FM-071)
+test_complete_merge_failure() {
+  echo ":: Testing complete merge-failure path (FM-071)" >&2
+
+  # Clean up stale worktrees from previous interrupted runs
+  for stale_dir in /tmp/MERGE-001; do
+    [[ -d "$stale_dir" ]] && rm -rf "$stale_dir"
+  done
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "line1" > "$project/shared.txt"
+  _test_commit "$project" "init"
+
+  # Set up a minimal factory structure (no install needed, no pre-commit hook)
+  mkdir -p "$project/factory/bin" "$project/factory/backlog" \
+    "$project/factory/.runs"
+
+  # Copy engine scripts needed by complete (prefer source engine over installed copy)
+  local complete_src="$PROJECT_ROOT/bin/complete"
+  [[ -f "$complete_src" ]] || complete_src="$FACTORY_DIR/bin/complete"
+  cp "$complete_src" "$project/factory/bin/complete"
+  local db_src="$PROJECT_ROOT/bin/db"
+  [[ -f "$db_src" ]] || db_src="$FACTORY_DIR/bin/db"
+  cp "$db_src" "$project/factory/bin/db"
+  chmod +x "$project/factory/bin/complete" "$project/factory/bin/db"
+
+  # Symlinks for backward compat
+  ln -sf "bin/complete" "$project/factory/complete"
+  ln -sf "bin/db" "$project/factory/db"
+
+  # Create backlog item
+  cat > "$project/factory/backlog/MERGE-001.md" <<'ITEM'
+---
+id: MERGE-001
+title: Merge conflict test
+status: open
+priority: 1
+files:
+  - shared.txt
+depends-on: []
+---
+
+Test item for merge conflict scenario.
+ITEM
+
+  _test_commit "$project" "add factory"
+
+  # Create fix branch with a conflicting change
+  git -C "$project" checkout -b "fix/MERGE-001" 2>/dev/null
+  echo "branch-change" > "$project/shared.txt"
+  _test_commit "$project" "impl(MERGE-001): branch change"
+
+  # Go back to main and make a conflicting change
+  git -C "$project" checkout main 2>/dev/null
+  echo "main-change" > "$project/shared.txt"
+  _test_commit "$project" "conflicting main change"
+
+  # Create a worktree for the fix branch (complete expects this)
+  local wt="/tmp/MERGE-001"
+  rm -rf "$wt"
+  git -C "$project" worktree add "$wt" "fix/MERGE-001" 2>/dev/null
+
+  # Set up .runs context with gate_result=pass so complete proceeds
+  cat > "$project/factory/.runs/MERGE-001.json" <<JSON
+{
+  "item_id": "MERGE-001",
+  "worktree": "$wt",
+  "gate_result": "pass"
+}
+JSON
+
+  # Add item to .in-progress
+  printf 'MERGE-001\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" > "$project/factory/.in-progress"
+
+  # Run complete - should fail due to merge conflict
+  local output exit_code
+  output=$("$project/factory/complete" MERGE-001 2>&1) && exit_code=0 || exit_code=$?
+
+  # 1. Verify non-zero exit
+  assert_eq "complete exits non-zero on conflict" "true" "$([[ "$exit_code" -ne 0 ]] && echo true || echo false)"
+
+  # 2. Verify the branch is NOT deleted
+  local branch_exists
+  branch_exists=$(git -C "$project" branch --list "fix/MERGE-001" 2>/dev/null)
+  assert_eq "branch preserved after conflict" "true" "$([[ -n "$branch_exists" ]] && echo true || echo false)"
+
+  # 3. Verify the item is NOT marked as fixed
+  local item_status
+  item_status=$(sed -n '/^---$/,/^---$/p' "$project/factory/backlog/MERGE-001.md" | grep "^status:" | sed "s/^status: *//" | tr -d '"')
+  assert_eq "item not marked fixed after conflict" "open" "$item_status"
+
+  # 4. Verify .in-progress is cleaned up (slot freed)
+  local in_prog
+  in_prog=$(grep "MERGE-001" "$project/factory/.in-progress" 2>/dev/null || true)
+  assert_eq "in-progress cleaned up after conflict" "" "$in_prog"
+
+  # 5. Verify stderr message mentions preserved branch
+  assert_contains "stderr mentions branch preserved" "Branch fix/MERGE-001 preserved" "$output"
+
+  # Clean up
+  git -C "$project" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$project" worktree prune 2>/dev/null || true
+  git -C "$project" branch -D "fix/MERGE-001" 2>/dev/null || true
+  rm -rf "$project"
+}
+
+# Test: install --update works from self-hosted factory (templates at parent level)
+test_install_self_hosted() {
+  echo ":: Testing install --update from self-hosted factory (FM-073)" >&2
+
+  local src_templates="$FACTORY_DIR/install-templates"
+  [[ -d "$src_templates" ]] || src_templates="$FACTORY_DIR/../install-templates"
+  if [[ ! -d "$src_templates" ]]; then
+    echo "  SKIP: install-templates/ not found (target project)" >&2
+    return 0
+  fi
+
+  # Build a self-hosted factory repo:
+  #   repo_root/
+  #     install-templates/   <-- templates at project root
+  #     factory/             <-- FACTORY_DIR (engine lives here)
+  #       bin/install
+  #       .factory-manifest
+  #       ...
+  local repo
+  repo=$(mktemp -d)
+
+  # Copy install-templates to repo root
+  cp -R "$src_templates" "$repo/install-templates"
+
+  # Create a factory/ subdirectory with engine files
+  mkdir -p "$repo/factory/bin" "$repo/factory/meta"
+  cp "$FACTORY_DIR/.factory-manifest" "$repo/factory/"
+  cp "$FACTORY_DIR/bin/install" "$repo/factory/bin/install"
+  chmod +x "$repo/factory/bin/install"
+  # Symlink for backward compat
+  ln -s "bin/install" "$repo/factory/install"
+
+  # Verify install-templates is NOT inside factory/
+  assert_eq "self-hosted: no templates in factory/" "false" \
+    "$([[ -d "$repo/factory/install-templates" ]] && echo true || echo false)"
+
+  # Create a target project to install into
+  local target
+  target=$(mktemp -d)
+  git -C "$target" init -q 2>/dev/null
+
+  # Fresh install from the self-hosted factory
+  local output exit_code
+  output=$("$repo/factory/bin/install" "$target" --language generic 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "self-hosted: fresh install exits 0" "0" "$exit_code"
+  assert_eq "self-hosted: factory.json created" "true" \
+    "$([[ -f "$target/factory/factory.json" ]] && echo true || echo false)"
+
+  # Now test --update from the self-hosted factory
+  output=$("$repo/factory/bin/install" "$target" --update 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "self-hosted: update exits 0" "0" "$exit_code"
+  assert_contains "self-hosted: update message" "Updating engine" "$output"
+
+  rm -rf "$repo" "$target"
+}
+
+# Test one-time commit token mechanism (FM-074)
+test_commit_tokens() {
+  echo ":: Testing commit tokens (FM-074)" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "init" > "$project/README.md"
+  _test_commit "$project" "init"
+
+  # Install factory to get the pre-commit hook
+  "$INSTALL_SCRIPT" "$project" --language generic >/dev/null 2>&1
+  _test_commit "$project" "add factory"
+
+  # Extract the pre-commit hook's main function for isolated testing
+  local hook="$project/.git/hooks/pre-commit"
+  assert_eq "pre-commit hook installed" "true" "$([[ -f "$hook" ]] && echo true || echo false)"
+
+  # Test 1: commit on main without token is blocked
+  echo "change1" > "$project/README.md"
+  git -C "$project" add -A 2>/dev/null
+  local output exit_code
+  output=$(git -C "$project" commit -m "should be blocked" 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "commit blocked without token" "1" "$exit_code"
+
+  # Test 2: commit on main with token succeeds and token is consumed
+  _gen_token "$project"
+  assert_eq "token file exists before commit" "true" "$([[ -f "$project/factory/.runs/.commit-token" ]] && echo true || echo false)"
+  output=$(git -C "$project" commit -m "should pass with token" 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "commit allowed with token" "0" "$exit_code"
+  assert_eq "token consumed after commit" "false" "$([[ -f "$project/factory/.runs/.commit-token" ]] && echo true || echo false)"
+
+  # Test 3: second commit after token consumed is blocked (single-use)
+  echo "change2" > "$project/README.md"
+  git -C "$project" add -A 2>/dev/null
+  output=$(git -C "$project" commit -m "should be blocked again" 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "commit blocked after token consumed" "1" "$exit_code"
+
+  # Test 4: commits on non-main branches work without token
+  git -C "$project" checkout -b "fix/TOKEN-TEST" 2>/dev/null
+  output=$(git -C "$project" commit -m "branch commit no token" 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "branch commit works without token" "0" "$exit_code"
+
+  git -C "$project" checkout main 2>/dev/null
+  git -C "$project" branch -D "fix/TOKEN-TEST" 2>/dev/null || true
+  rm -rf "$project"
+}
+
+# Test violation lockout mechanism (FM-075)
+test_violation_lockout() {
+  echo ":: Testing violation lockout (FM-075)" >&2
+
+  # Find hooks directory - may be at FACTORY_DIR/install-templates or FACTORY_DIR/../install-templates
+  local hooks_dir="$FACTORY_DIR/install-templates/hooks"
+  [[ -d "$hooks_dir" ]] || hooks_dir="$FACTORY_DIR/../install-templates/hooks"
+  if [[ ! -d "$hooks_dir" ]]; then
+    echo "  SKIP: install-templates/hooks/ not found (target project)" >&2
+    return 0
+  fi
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "init" > "$project/README.md"
+  mkdir -p "$project/src"
+  echo "print('hello')" > "$project/src/main.py"
+  _test_commit "$project" "init"
+
+  # Set up factory structure with hooks
+  mkdir -p "$project/factory/.runs" "$project/factory/backlog"
+  cp "$hooks_dir/post-bash-monitor.sh" "$project/_post_bash_monitor.sh"
+  cp "$hooks_dir/enforce-worktree.sh" "$project/_enforce_worktree.sh"
+  cp "$hooks_dir/enforce-factory-flow.sh" "$project/_enforce_factory_flow.sh"
+  chmod +x "$project/_post_bash_monitor.sh" "$project/_enforce_worktree.sh" "$project/_enforce_factory_flow.sh"
+
+  # Test 1: post-bash-monitor creates lockout file when source files modified on main
+  echo "modified" > "$project/src/main.py"
+  local output
+  output=$(cd "$project" && echo '{}' | bash "$project/_post_bash_monitor.sh" 2>&1) || true
+  assert_eq "lockout: file created on violation" "true" \
+    "$([[ -f "$project/factory/.runs/.violation-lockout" ]] && echo true || echo false)"
+  assert_contains "lockout: file lists modified source" "src/main.py" \
+    "$(cat "$project/factory/.runs/.violation-lockout" 2>/dev/null)"
+
+  # Test 2: post-bash-monitor clears lockout when violations reverted
+  git -C "$project" checkout -- src/main.py 2>/dev/null
+  output=$(cd "$project" && echo '{}' | bash "$project/_post_bash_monitor.sh" 2>&1) || true
+  assert_eq "lockout: file removed after revert" "false" \
+    "$([[ -f "$project/factory/.runs/.violation-lockout" ]] && echo true || echo false)"
+
+  # Test 3: enforce-worktree blocks Edit/Write when lockout exists
+  echo "src/main.py" > "$project/factory/.runs/.violation-lockout"
+  local ew_input='{"tool_name":"Edit","tool_input":{"file_path":"/tmp/some/file.py","old_string":"x","new_string":"y"}}'
+  local ew_output ew_exit
+  ew_output=$(cd "$project" && echo "$ew_input" | bash "$project/_enforce_worktree.sh" 2>&1) && ew_exit=0 || ew_exit=$?
+  assert_eq "lockout: enforce-worktree blocks edit" "2" "$ew_exit"
+  assert_contains "lockout: enforce-worktree message" "BLOCKED" "$ew_output"
+
+  # Test 4: enforce-factory-flow allows git checkout during lockout
+  local ef_input_checkout='{"tool_name":"Bash","tool_input":{"command":"git checkout -- src/main.py"}}'
+  local ef_output ef_exit
+  ef_output=$(cd "$project" && echo "$ef_input_checkout" | bash "$project/_enforce_factory_flow.sh" 2>&1) && ef_exit=0 || ef_exit=$?
+  assert_eq "lockout: factory-flow allows git checkout" "0" "$ef_exit"
+
+  # Also test git restore and git diff are allowed
+  local ef_input_restore='{"tool_name":"Bash","tool_input":{"command":"git restore src/main.py"}}'
+  ef_output=$(cd "$project" && echo "$ef_input_restore" | bash "$project/_enforce_factory_flow.sh" 2>&1) && ef_exit=0 || ef_exit=$?
+  assert_eq "lockout: factory-flow allows git restore" "0" "$ef_exit"
+
+  local ef_input_status='{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+  ef_output=$(cd "$project" && echo "$ef_input_status" | bash "$project/_enforce_factory_flow.sh" 2>&1) && ef_exit=0 || ef_exit=$?
+  assert_eq "lockout: factory-flow allows git status" "0" "$ef_exit"
+
+  # Test 5: enforce-factory-flow blocks non-revert commands during lockout
+  local ef_input_build='{"tool_name":"Bash","tool_input":{"command":"python3 src/main.py"}}'
+  ef_output=$(cd "$project" && echo "$ef_input_build" | bash "$project/_enforce_factory_flow.sh" 2>&1) && ef_exit=0 || ef_exit=$?
+  assert_eq "lockout: factory-flow blocks non-revert cmd" "2" "$ef_exit"
+  assert_contains "lockout: factory-flow block message" "BLOCKED" "$ef_output"
+
+  # Clean up
+  rm -rf "$project"
+}
+
+# Test self-hosted factory sync on complete (FM-076)
+test_self_hosted_sync() {
+  echo ":: Testing self-hosted sync on complete (FM-076)" >&2
+
+  # Clean up stale worktrees from previous interrupted runs
+  for stale_dir in /tmp/SYNC-001 /tmp/SYNC-002; do
+    [[ -d "$stale_dir" ]] && rm -rf "$stale_dir"
+  done
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "init" > "$project/README.md"
+  _test_commit "$project" "init"
+
+  # Build a self-hosted factory structure:
+  #   project/bin/         (engine at root - authoritative)
+  #   project/factory/bin/ (copy to be synced)
+  #   project/meta/test    (authoritative)
+  #   project/factory/meta/test (copy to be synced)
+  mkdir -p "$project/bin" "$project/factory/bin" \
+    "$project/factory/backlog" "$project/factory/.runs" \
+    "$project/meta" "$project/factory/meta"
+
+  # Both bin/complete and factory/bin/complete get the real script
+  # (factory/bin/complete is what actually executes via symlink)
+  cp "$FACTORY_DIR/bin/complete" "$project/bin/complete"
+  cp "$FACTORY_DIR/bin/complete" "$project/factory/bin/complete"
+  chmod +x "$project/bin/complete" "$project/factory/bin/complete"
+
+  # bin/db is the authoritative version; factory/bin/db is stale
+  cp "$FACTORY_DIR/bin/db" "$project/bin/db"
+  chmod +x "$project/bin/db"
+  echo "#!/usr/bin/env bash" > "$project/factory/bin/db"
+  echo "# stale db" >> "$project/factory/bin/db"
+  chmod +x "$project/factory/bin/db"
+
+  # meta/test at root is authoritative; factory/meta/test is stale
+  echo "#!/usr/bin/env bash" > "$project/meta/test"
+  echo "# current meta test" >> "$project/meta/test"
+  echo "#!/usr/bin/env bash" > "$project/factory/meta/test"
+  echo "# stale meta test" >> "$project/factory/meta/test"
+
+  # Symlinks for backward compat
+  ln -sf "bin/complete" "$project/factory/complete"
+  ln -sf "bin/db" "$project/factory/db"
+
+  # Create backlog item
+  cat > "$project/factory/backlog/SYNC-001.md" <<'ITEM'
+---
+id: SYNC-001
+title: Self-hosted sync test
+status: open
+priority: 1
+files:
+  - README.md
+depends-on: []
+---
+
+Test item for self-hosted sync.
+ITEM
+
+  _test_commit "$project" "add factory"
+
+  # Create fix branch with a change
+  git -C "$project" checkout -b "fix/SYNC-001" 2>/dev/null
+  echo "changed" > "$project/README.md"
+  _test_commit "$project" "impl(SYNC-001): change readme"
+
+  # Go back to main
+  git -C "$project" checkout main 2>/dev/null
+
+  # Create a worktree for the fix branch
+  local wt="/tmp/SYNC-001"
+  rm -rf "$wt"
+  git -C "$project" worktree add "$wt" "fix/SYNC-001" 2>/dev/null
+
+  # Set up .runs context with gate_result=pass
+  cat > "$project/factory/.runs/SYNC-001.json" <<JSON
+{
+  "item_id": "SYNC-001",
+  "worktree": "$wt",
+  "gate_result": "pass"
+}
+JSON
+
+  # Add item to .in-progress
+  printf 'SYNC-001\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" > "$project/factory/.in-progress"
+
+  # Run complete
+  local output exit_code
+  output=$("$project/factory/complete" SYNC-001 2>&1) && exit_code=0 || exit_code=$?
+
+  assert_eq "self-hosted sync: complete exits 0" "0" "$exit_code"
+
+  # Verify factory/bin/db was synced from bin/db
+  local db_match
+  if diff -q "$project/bin/db" "$project/factory/bin/db" >/dev/null 2>&1; then
+    db_match="true"
+  else
+    db_match="false"
+  fi
+  assert_eq "self-hosted sync: factory/bin/db matches bin/db" "true" "$db_match"
+
+  # Verify factory/meta/test was synced from meta/test
+  local meta_match
+  if diff -q "$project/meta/test" "$project/factory/meta/test" >/dev/null 2>&1; then
+    meta_match="true"
+  else
+    meta_match="false"
+  fi
+  assert_eq "self-hosted sync: factory/meta/test matches meta/test" "true" "$meta_match"
+
+  # Verify the sync message was printed
+  assert_contains "self-hosted sync: message printed" "Self-hosted sync" "$output"
+
+  # ---- Test non-self-hosted is unaffected ----
+  local project2
+  project2=$(mktemp -d)
+  git -C "$project2" init -q -b main 2>/dev/null
+  echo "init" > "$project2/README.md"
+  _test_commit "$project2" "init"
+
+  # Non-self-hosted: only factory/bin/ exists, no root bin/
+  mkdir -p "$project2/factory/bin" "$project2/factory/backlog" "$project2/factory/.runs"
+  cp "$FACTORY_DIR/bin/complete" "$project2/factory/bin/complete"
+  cp "$FACTORY_DIR/bin/db" "$project2/factory/bin/db"
+  chmod +x "$project2/factory/bin/complete" "$project2/factory/bin/db"
+  ln -sf "bin/complete" "$project2/factory/complete"
+  ln -sf "bin/db" "$project2/factory/db"
+
+  cat > "$project2/factory/backlog/SYNC-002.md" <<'ITEM'
+---
+id: SYNC-002
+title: Non-self-hosted test
+status: open
+priority: 1
+files:
+  - README.md
+depends-on: []
+---
+
+Test that non-self-hosted is unaffected.
+ITEM
+
+  _test_commit "$project2" "add factory"
+
+  git -C "$project2" checkout -b "fix/SYNC-002" 2>/dev/null
+  echo "changed" > "$project2/README.md"
+  _test_commit "$project2" "impl(SYNC-002): change"
+  git -C "$project2" checkout main 2>/dev/null
+
+  local wt2="/tmp/SYNC-002"
+  rm -rf "$wt2"
+  git -C "$project2" worktree add "$wt2" "fix/SYNC-002" 2>/dev/null
+
+  cat > "$project2/factory/.runs/SYNC-002.json" <<JSON
+{
+  "item_id": "SYNC-002",
+  "worktree": "$wt2",
+  "gate_result": "pass"
+}
+JSON
+
+  printf 'SYNC-002\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" > "$project2/factory/.in-progress"
+
+  local output2 exit_code2
+  output2=$("$project2/factory/complete" SYNC-002 2>&1) && exit_code2=0 || exit_code2=$?
+
+  assert_eq "non-self-hosted: complete exits 0" "0" "$exit_code2"
+
+  # Verify no sync message
+  local has_sync_msg="false"
+  echo "$output2" | grep -q "Self-hosted sync" && has_sync_msg="true"
+  assert_eq "non-self-hosted: no sync message" "false" "$has_sync_msg"
+
+  # Clean up
+  git -C "$project" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$project" worktree prune 2>/dev/null || true
+  git -C "$project2" worktree remove --force "$wt2" 2>/dev/null || true
+  git -C "$project2" worktree prune 2>/dev/null || true
+  rm -rf "$project" "$project2"
+}
+
+# Test auto-pair files and backlog exclusion from atomicity cap (FM-077)
+test_auto_pair_files() {
+  echo ":: Testing auto-pair files and backlog exclusion (FM-077)" >&2
+  if [[ "$IS_SOURCE_REPO" != "true" ]]; then
+    echo "  SKIP: install not present (target project)" >&2
+    return 0
+  fi
+
+  # Clean up stale worktrees from previous interrupted runs
+  for stale_dir in /tmp/PAIR-001 /tmp/PAIR-002 /tmp/GATE-001; do
+    [[ -d "$stale_dir" ]] && rm -rf "$stale_dir"
+  done
+
+  local project
+  project=$(mktemp -d)
+  git -C "$project" init -q -b main 2>/dev/null
+  echo "# test" > "$project/README.md"
+  mkdir -p "$project/src"
+  echo "print('hello')" > "$project/src/main.py"
+  _test_commit "$project" "init"
+
+  "$INSTALL_SCRIPT" "$project" --language python >/dev/null 2>&1
+  _test_commit "$project" "add factory"
+
+  # Override test/lint commands so they pass
+  python3 -c "
+import json
+f = '$project/factory/factory.json'
+with open(f) as fh:
+    d = json.load(fh)
+d['commands']['test'] = ''
+d['commands']['lint'] = ''
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+"
+
+  # ---- Test 1: bin/test in files list auto-pairs meta/test ----
+  cat > "$project/factory/backlog/PAIR-001.md" <<'ITEM'
+---
+id: PAIR-001
+title: Auto-pair test
+status: open
+priority: 1
+files:
+  - bin/test
+depends-on: []
+---
+
+Test that bin/test auto-pairs with meta/test.
+ITEM
+
+  _test_commit "$project" "add PAIR-001"
+
+  local output exit_code
+  output=$("$project/factory/resolve" PAIR-001 2>&1) && exit_code=0 || exit_code=$?
+
+  assert_eq "pair: resolve exits 0" "0" "$exit_code"
+  assert_contains "pair: auto-paired message" "Auto-paired: meta/test" "$output"
+
+  # Verify meta/test appears in the prompt scope
+  assert_contains "pair: prompt has meta/test" "meta/test" "$output"
+
+  # Verify the frontmatter was updated
+  local files_after
+  files_after=$(sed -n '/^---$/,/^---$/p' "$project/factory/backlog/PAIR-001.md" | sed -n '/^files:$/,/^[^ ]/p' | grep '^ *- ' | sed 's/^ *- *//')
+  assert_contains "pair: frontmatter has meta/test" "meta/test" "$files_after"
+
+  git -C "$project" worktree remove --force "/tmp/PAIR-001" 2>/dev/null || true
+  git -C "$project" branch -D "fix/PAIR-001" 2>/dev/null || true
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+
+  # ---- Test 2: backlog self-reference excluded from atomicity count ----
+  # Set max_files_modified to 5 explicitly
+  cat > "$project/factory/context/atomicity.json" <<'JSON'
+{
+  "implementation": {
+    "max_files_modified": 5,
+    "single_feature": true,
+    "allowed_exceptions": []
+  }
+}
+JSON
+
+  # 5 real files + 1 backlog self-reference = 6 total, but should pass (backlog excluded)
+  cat > "$project/factory/backlog/PAIR-002.md" <<'ITEM'
+---
+id: PAIR-002
+title: Backlog exclusion test
+status: open
+priority: 1
+files:
+  - src/a.py
+  - src/b.py
+  - src/c.py
+  - src/d.py
+  - src/e.py
+  - factory/backlog/PAIR-002.md
+depends-on: []
+---
+
+Test that backlog self-reference is excluded from atomicity count.
+ITEM
+
+  _test_commit "$project" "add PAIR-002"
+
+  output=$("$project/factory/resolve" PAIR-002 2>&1) && exit_code=0 || exit_code=$?
+  assert_eq "backlog-excl: resolve exits 0 (5 code + 1 backlog)" "0" "$exit_code"
+
+  git -C "$project" worktree remove --force "/tmp/PAIR-002" 2>/dev/null || true
+  git -C "$project" branch -D "fix/PAIR-002" 2>/dev/null || true
+  rm -f "$project/factory/.in-progress"
+  rm -rf "$project/factory/.runs"
+  rm -rf "$project/factory/.resolve.lock"
+
+  # ---- Test 3: gate allows factory/bin/X when bin/X is declared (self-hosted) ----
+  # Build a self-hosted project with both bin/ and factory/bin/
+  local sh_project
+  sh_project=$(mktemp -d)
+  git -C "$sh_project" init -q -b main 2>/dev/null
+  echo "init" > "$sh_project/README.md"
+  mkdir -p "$sh_project/bin" "$sh_project/factory/bin" \
+    "$sh_project/factory/backlog" "$sh_project/factory/.runs"
+
+  # Copy gate script
+  cp "$FACTORY_DIR/bin/gate" "$sh_project/factory/bin/gate"
+  cp "$FACTORY_DIR/bin/db" "$sh_project/factory/bin/db"
+  chmod +x "$sh_project/factory/bin/gate" "$sh_project/factory/bin/db"
+  ln -sf "bin/gate" "$sh_project/factory/gate"
+  ln -sf "bin/db" "$sh_project/factory/db"
+
+  # Create a script in both locations
+  echo '#!/usr/bin/env bash' > "$sh_project/bin/resolve"
+  echo 'echo original' >> "$sh_project/bin/resolve"
+  cp "$sh_project/bin/resolve" "$sh_project/factory/bin/resolve"
+
+  cat > "$sh_project/factory/backlog/GATE-001.md" <<'ITEM'
+---
+id: GATE-001
+title: Self-hosted gate test
+status: open
+priority: 1
+files:
+  - bin/resolve
+depends-on: []
+---
+
+Test that gate allows factory/bin/resolve when bin/resolve is declared.
+ITEM
+
+  _test_commit "$sh_project" "init"
+
+  # Create a fix branch that changes both bin/resolve and factory/bin/resolve
+  git -C "$sh_project" checkout -b "fix/GATE-001" 2>/dev/null
+  echo '#!/usr/bin/env bash' > "$sh_project/bin/resolve"
+  echo 'echo changed' >> "$sh_project/bin/resolve"
+  echo '#!/usr/bin/env bash' > "$sh_project/factory/bin/resolve"
+  echo 'echo changed' >> "$sh_project/factory/bin/resolve"
+  _test_commit "$sh_project" "impl(GATE-001): change resolve"
+
+  git -C "$sh_project" checkout main 2>/dev/null
+
+  local wt="/tmp/GATE-001"
+  rm -rf "$wt"
+  git -C "$sh_project" worktree add "$wt" "fix/GATE-001" 2>/dev/null
+
+  cat > "$sh_project/factory/.runs/GATE-001.json" <<JSON
+{
+  "item_id": "GATE-001",
+  "run_id": 0,
+  "worktree": "$wt",
+  "gate_weight": "light"
+}
+JSON
+
+  # Run the gate's diff check via a helper
+  local gate_helper="$sh_project/_gate_helper.sh"
+  cat > "$gate_helper" <<HELPER
+#!/usr/bin/env bash
+set +euo pipefail
+FACTORY_DIR="$sh_project/factory"
+PROJECT_ROOT="$sh_project"
+RUNS_DIR="$sh_project/factory/.runs"
+DB_PATH="$sh_project/factory/.telemetry.db"
+DEFAULT_BRANCH="main"
+record_rejection() { :; }
+get_run_field() { echo ""; }
+$(sed -n '/^get_config()/,/^}/p' "$FACTORY_DIR/gate")
+$(sed -n '/^layer1_diff_check()/,/^}/p' "$FACTORY_DIR/gate")
+layer1_diff_check "GATE-001" "$wt"
+HELPER
+
+  local diff_result
+  diff_result=$(bash "$gate_helper" 2>/dev/null)
+  assert_eq "gate-selfhosted: diff check passes with factory/bin/X" "OK" "$diff_result"
+
+  # Clean up
+  git -C "$sh_project" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$sh_project" worktree prune 2>/dev/null || true
+  git -C "$sh_project" branch -D "fix/GATE-001" 2>/dev/null || true
+  rm -rf "$sh_project" "$project"
+}
+
+# --- main ---
+
+main() {
+  local section="${1:-all}"
+
+  echo ":: Factory test suite" >&2
+  echo "" >&2
+
+  setup
+  trap teardown EXIT
+
+  case "$section" in
+    all)
+      test_db
+      test_gate_checks
+      test_triage_frontmatter
+      test_script_syntax
+      test_script_permissions
+      test_validate_behavior
+      test_manifest
+      test_factory_json
+      test_install_templates
+      test_install
+      test_contribute
+      test_get_config
+      test_extract_imports
+      test_layer2_dispatch
+      test_copy_templates
+      test_resolve_integration
+      test_test_coverage
+      test_test_fallback
+      test_imports_fallback
+      test_complete_merge_failure
+      test_acceptance
+      test_commit_tokens
+      test_install_self_hosted
+      test_violation_lockout
+      test_self_hosted_sync
+      test_auto_pair_files
+      ;;
+    db)               test_db ;;
+    gate_checks)      test_gate_checks ;;
+    parse)            test_triage_frontmatter ;;
+    syntax)           test_script_syntax ;;
+    perms)            test_script_permissions ;;
+    behavior)         test_validate_behavior ;;
+    manifest)         test_manifest ;;
+    factory_json)     test_factory_json ;;
+    install_templates) test_install_templates ;;
+    install)          test_install ;;
+    contribute)       test_contribute ;;
+    get_config)       test_get_config ;;
+    extract_imports)  test_extract_imports ;;
+    layer2_dispatch)  test_layer2_dispatch ;;
+    copy_templates)   test_copy_templates ;;
+    resolve_integration) test_resolve_integration ;;
+    test_coverage)    test_test_coverage ;;
+    test_fallback)    test_test_fallback ;;
+    imports_fallback)  test_imports_fallback ;;
+    complete_merge_failure) test_complete_merge_failure ;;
+    acceptance)       test_acceptance ;;
+    commit_tokens)    test_commit_tokens ;;
+    install_self_hosted) test_install_self_hosted ;;
+    violation_lockout) test_violation_lockout ;;
+    self_hosted_sync) test_self_hosted_sync ;;
+    auto_pair_files)  test_auto_pair_files ;;
+    *)
+      die "Unknown section: $section. Valid: all, db, gate_checks, parse, syntax, perms, behavior, manifest, factory_json, install_templates, install, contribute, get_config, extract_imports, layer2_dispatch, copy_templates, resolve_integration, test_coverage, test_fallback, imports_fallback, complete_merge_failure, acceptance, commit_tokens, install_self_hosted, violation_lockout, self_hosted_sync, auto_pair_files"
+      ;;
+  esac
+
+  echo "" >&2
+  echo ":: Results: $PASS passed, $FAIL failed" >&2
+  [[ "$FAIL" -eq 0 ]]
+}
+
+main "$@"

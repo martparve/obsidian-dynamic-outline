@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# triage - Backlog prioritization: scans items, scores readiness, selects next
+#
+# Scans all backlog/*.md items and classifies them as ready, blocked, or fixed.
+# Ready means: status=open, not already in-progress, all dependencies completed.
+# Scoring formula: priority * p_weight + downstream_count * d_weight + iso_bonus.
+# Weights are configurable via tiers.json. Items with file overlap against
+# in-progress work are excluded from selection.
+#
+# Called by: ./resolve (--next mode), ./run (autonomous dispatch)
+# Reads: backlog/*.md (YAML frontmatter), .in-progress, context/tiers.json
+#
+# Usage:
+#   ./triage              # Show all items grouped by status
+#   ./triage --next 3     # Emit up to 3 highest-scored ready item IDs (stdout)
+#   ./triage --blocked    # Show blocked items and what blocks them
+#   ./triage --stats      # Gate run outcome counts from telemetry
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+IN_PROGRESS="$FACTORY_DIR/.in-progress"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+TIERS_FILE="$FACTORY_DIR/context/tiers.json"
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Read a scalar field from YAML frontmatter in a backlog item
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Read a list field (YAML dash-items) from YAML frontmatter
+get_list_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | sed -n "/^${field}:$/,/^[^ ]/p" | grep '^ *- ' | sed 's/^ *- *//' || true
+}
+
+# Dump raw .in-progress file contents
+get_in_progress_items() {
+  if [[ -f "$IN_PROGRESS" ]] && [[ -s "$IN_PROGRESS" ]]; then
+    cat "$IN_PROGRESS"
+  fi
+}
+
+# Collect all file paths claimed by in-progress items
+get_in_progress_files() {
+  local ip_items
+  ip_items=$(get_in_progress_items)
+  while IFS= read -r item_id; do
+    [[ -n "$item_id" ]] || continue
+    local item_file="$BACKLOG_DIR/${item_id}.md"
+    [[ -f "$item_file" ]] || continue
+    get_list_field "$item_file" "files"
+  done <<< "$ip_items"
+}
+
+# Check if an item is dispatchable: open, not in-progress, all deps completed
+is_ready() {
+  local item_file="$1"
+  local status
+  status=$(get_field "$item_file" "status")
+  [[ "$status" == "open" ]] || return 1
+
+  local ip_items
+  ip_items=$(get_in_progress_items)
+  local item_id
+  item_id=$(get_field "$item_file" "id")
+  echo "$ip_items" | grep -qx "$item_id" 2>/dev/null && return 1
+
+  local deps
+  deps=$(get_list_field "$item_file" "depends-on")
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    local dep_file="$BACKLOG_DIR/${dep}.md"
+    [[ -f "$dep_file" ]] || return 1
+    local dep_status
+    dep_status=$(get_field "$dep_file" "status")
+    [[ "$dep_status" == "fixed" ]] || return 1
+  done <<< "$deps"
+
+  return 0
+}
+
+# Return 0 (true) if any of the item's files are already claimed by in-progress work
+has_file_overlap() {
+  local item_file="$1"
+  local ip_files="$2"
+  local item_files
+  item_files=$(get_list_field "$item_file" "files")
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    echo "$ip_files" | grep -qx "$f" 2>/dev/null && return 0
+  done <<< "$item_files"
+  return 1
+}
+
+# Compute a priority score: priority * weight + downstream_count * weight + isolation bonus
+score_item() {
+  local item_file="$1"
+  local priority
+  priority=$(get_field "$item_file" "priority")
+  [[ -n "$priority" ]] || priority=3
+
+  local item_id
+  item_id=$(get_field "$item_file" "id")
+  local downstream_count=0
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    if get_list_field "$f" "depends-on" | grep -qx "$item_id" 2>/dev/null; then
+      downstream_count=$((downstream_count + 1))
+    fi
+  done
+
+  # Configurable weights: priority dominates, downstream unlocks add value, isolation is a bonus
+  local p_weight=10 d_weight=3 iso_bonus=5 depth_penalty=2
+  if [[ -f "$TIERS_FILE" ]]; then
+    local sw
+    sw=$(grep 'priority' "$TIERS_FILE" | grep -o '[0-9]*' | head -1)
+    [[ -n "$sw" ]] && p_weight="$sw"
+    sw=$(grep 'downstream_count' "$TIERS_FILE" | grep -o '[0-9]*' | head -1)
+    [[ -n "$sw" ]] && d_weight="$sw"
+  fi
+
+  local score=$(( priority * p_weight + downstream_count * d_weight + iso_bonus ))
+  echo "$score"
+}
+
+# Display all backlog items grouped by status (READY / BLOCKED / fixed)
+show_all() {
+  echo ":: Backlog Overview" >&2
+  echo "" >&2
+
+  local open=0 fixed=0 blocked=0
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    local status
+    status=$(get_field "$f" "status")
+    local id
+    id=$(get_field "$f" "id")
+    local title
+    title=$(get_field "$f" "title")
+
+    case "$status" in
+      open)
+        if is_ready "$f"; then
+          echo "  READY  $id: $title" >&2
+          open=$((open + 1))
+        else
+          echo "  BLOCKED $id: $title" >&2
+          blocked=$((blocked + 1))
+        fi
+        ;;
+      fixed)
+        fixed=$((fixed + 1))
+        ;;
+    esac
+  done
+  echo "" >&2
+  echo ":: Summary: $fixed fixed, $open ready, $blocked blocked" >&2
+}
+
+# Score all ready items, exclude file overlaps, emit top N IDs sorted by score descending
+select_next() {
+  local slots="${1:-3}"
+  local ip_count=0
+  if [[ -f "$IN_PROGRESS" ]] && [[ -s "$IN_PROGRESS" ]]; then
+    ip_count=$(wc -l < "$IN_PROGRESS" | tr -d ' ')
+  fi
+
+  local available=$((slots - ip_count))
+  if [[ "$available" -le 0 ]]; then
+    echo ":: No slots available ($ip_count/$slots in progress)" >&2
+    return 0
+  fi
+
+  local ip_files
+  ip_files=$(get_in_progress_files)
+
+  local scored_items=""
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    if ! is_ready "$f"; then continue; fi
+    if has_file_overlap "$f" "$ip_files"; then continue; fi
+
+    local score
+    score=$(score_item "$f")
+    local id
+    id=$(get_field "$f" "id")
+    scored_items+="$score $id"$'\n'
+  done
+
+  local selected
+  selected=$(echo "$scored_items" | sort -rn | head -"$available" | awk '{print $2}')
+
+  if [[ -z "$selected" ]]; then
+    echo ":: No ready items found" >&2
+    return 0
+  fi
+
+  echo "$selected"
+}
+
+# List blocked items and which dependencies are holding them back
+show_blocked() {
+  echo ":: Blocked Items" >&2
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    local status
+    status=$(get_field "$f" "status")
+    [[ "$status" == "open" ]] || continue
+
+    if is_ready "$f"; then continue; fi
+
+    local id
+    id=$(get_field "$f" "id")
+    local title
+    title=$(get_field "$f" "title")
+    echo "  $id: $title" >&2
+
+    local deps
+    deps=$(get_list_field "$f" "depends-on")
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      local dep_file="$BACKLOG_DIR/${dep}.md"
+      if [[ -f "$dep_file" ]]; then
+        local dep_status
+        dep_status=$(get_field "$dep_file" "status")
+        [[ "$dep_status" != "fixed" ]] && echo "    blocked by: $dep ($dep_status)" >&2
+      else
+        echo "    blocked by: $dep (not found)" >&2
+      fi
+    done <<< "$deps"
+  done
+}
+
+# Display gate run outcome counts from telemetry
+show_stats() {
+  if [[ ! -f "$DB_PATH" ]]; then
+    echo ":: No telemetry database yet" >&2
+    return 0
+  fi
+  echo ":: Telemetry Stats" >&2
+  sqlite3 -cmd ".timeout 5000" -column -header "$DB_PATH" \
+    "SELECT outcome, COUNT(*) as count FROM gate_runs GROUP BY outcome;" 2>/dev/null || echo "  No gate runs recorded yet" >&2
+}
+
+# --- main ---
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    --next)
+      select_next "${2:-3}"
+      ;;
+    --blocked)
+      show_blocked
+      ;;
+    --stats)
+      show_stats
+      ;;
+    --dry-run)
+      echo "[DRY RUN]" >&2
+      show_all
+      ;;
+    --archive)
+      echo ":: Archive not yet implemented" >&2
+      ;;
+    "")
+      show_all
+      ;;
+    *)
+      die "Unknown option: $cmd. Valid: --next [N], --blocked, --stats, --dry-run, --archive"
+      ;;
+  esac
+}
+
+main "$@"

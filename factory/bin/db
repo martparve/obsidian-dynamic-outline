@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# db - Telemetry database layer: SQLite init, inserts, queries, and reporting
+#
+# Provides a CLI interface to the factory's SQLite telemetry database. All other
+# factory scripts call this rather than touching SQLite directly. Uses WAL mode
+# and a 5-second busy timeout for concurrent access from parallel agents.
+#
+# Tables: gate_runs (agent invocations), dimension_scores (evaluator results),
+# rejections (gate failure details), gate_checks (per-check pass/fail/skip),
+# items (lifecycle tracking), gate_executions (gate run metadata),
+# agent_events (token/timing telemetry), diff_stats (per-file change sizes),
+# complete_events (merge outcomes and cycle times).
+#
+# Called by: ./resolve, ./gate, ./complete, ./score, ./run, ./report
+# Reads/writes: .telemetry.db
+#
+# Usage:
+#   ./db init                                    # Create tables and indexes
+#   ./db insert-run FM-001 builder impl 1 ...    # Record an agent run
+#   ./db insert-score 42 arch 0.85 0.9 pass ...  # Record a dimension score
+#   ./db query "SELECT * FROM gate_runs"         # Raw SQL query
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Execute SQL with 5s busy timeout, suppress errors to stderr (non-fatal)
+sql() {
+  local query="$1"
+  local errfile
+  errfile=$(mktemp)
+  sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$query" 2>"$errfile" || {
+    echo "WARN: sqlite3 failed: $(cat "$errfile")" >&2
+    rm -f "$errfile"
+    return 0
+  }
+  rm -f "$errfile"
+}
+
+# Execute SQL and return stdout (for SELECT/last_insert_rowid queries)
+sql_returning() {
+  local query="$1"
+  local errfile
+  errfile=$(mktemp)
+  local output
+  output=$(sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$query" 2>"$errfile") || {
+    echo "WARN: sqlite3 failed: $(cat "$errfile")" >&2
+    rm -f "$errfile"
+    return 0
+  }
+  rm -f "$errfile"
+  echo "$output"
+}
+
+# Create all tables and indexes; enables WAL mode for concurrent agent access
+init_db() {
+  # WAL mode allows concurrent reads from parallel agents during writes
+  sql "PRAGMA journal_mode=WAL;" >/dev/null 2>&1
+
+  sql "
+CREATE TABLE IF NOT EXISTS gate_runs (
+    id              INTEGER PRIMARY KEY,
+    item_id         TEXT    NOT NULL,
+    agent           TEXT    NOT NULL,
+    stage           TEXT    NOT NULL,
+    attempt         INTEGER NOT NULL DEFAULT 1,
+    gate_weight     TEXT    NOT NULL CHECK(gate_weight IN ('light','medium','heavy')),
+    parent_run_id   INTEGER REFERENCES gate_runs(id),
+    outcome         TEXT    NOT NULL CHECK(outcome IN ('pass','fail','review','crash')),
+    started_at      TEXT    NOT NULL,
+    finished_at     TEXT,
+    duration_ms     INTEGER,
+    context_tokens  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dimension_scores (
+    id         INTEGER PRIMARY KEY,
+    run_id     INTEGER NOT NULL REFERENCES gate_runs(id),
+    dimension  TEXT    NOT NULL,
+    score      REAL    NOT NULL,
+    confidence REAL    NOT NULL,
+    band       TEXT    NOT NULL CHECK(band IN ('pass','fail','review')),
+    evaluator  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rejections (
+    id        INTEGER PRIMARY KEY,
+    run_id    INTEGER NOT NULL REFERENCES gate_runs(id),
+    tier      TEXT    NOT NULL CHECK(tier IN ('deterministic','lint','evaluator')),
+    code      TEXT    NOT NULL,
+    dimension TEXT,
+    detail    TEXT    NOT NULL,
+    file_path TEXT,
+    line_no   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gate_checks (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES gate_runs(id),
+    layer       INTEGER NOT NULL CHECK(layer IN (1, 2, 3)),
+    check_name  TEXT    NOT NULL,
+    outcome     TEXT    NOT NULL CHECK(outcome IN ('pass', 'fail', 'skip', 'warn')),
+    detail      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    id                TEXT PRIMARY KEY,
+    title             TEXT NOT NULL,
+    priority          INTEGER,
+    file_count        INTEGER,
+    sensitivity       TEXT,
+    agent             TEXT,
+    gate_weight       TEXT,
+    first_resolved_at TEXT,
+    completed_at      TEXT,
+    final_status      TEXT,
+    total_attempts    INTEGER DEFAULT 0,
+    cycle_time_s      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gate_executions (
+    id               INTEGER PRIMARY KEY,
+    run_id           INTEGER REFERENCES gate_runs(id),
+    item_id          TEXT NOT NULL,
+    gate_weight      TEXT NOT NULL,
+    escalated_weight TEXT,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    duration_ms      INTEGER,
+    outcome          TEXT CHECK(outcome IN ('pass','fail','review','crash')),
+    failed_layer     INTEGER,
+    checks_total     INTEGER DEFAULT 0,
+    checks_passed    INTEGER DEFAULT 0,
+    checks_failed    INTEGER DEFAULT 0,
+    checks_skipped   INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS agent_events (
+    id                  INTEGER PRIMARY KEY,
+    run_id              INTEGER REFERENCES gate_runs(id),
+    item_id             TEXT NOT NULL,
+    agent               TEXT,
+    model               TEXT,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    duration_ms         INTEGER,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    total_tokens        INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_write_tokens  INTEGER,
+    tokens_per_sec      REAL,
+    tool_uses           INTEGER,
+    outcome             TEXT CHECK(outcome IN ('success','failure','timeout','unknown'))
+);
+
+CREATE TABLE IF NOT EXISTS diff_stats (
+    id               INTEGER PRIMARY KEY,
+    gate_execution_id INTEGER REFERENCES gate_executions(id),
+    item_id          TEXT NOT NULL,
+    file_path        TEXT NOT NULL,
+    lines_added      INTEGER NOT NULL DEFAULT 0,
+    lines_removed    INTEGER NOT NULL DEFAULT 0,
+    is_new           INTEGER NOT NULL DEFAULT 0,
+    is_deleted       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS complete_events (
+    id               INTEGER PRIMARY KEY,
+    run_id           INTEGER REFERENCES gate_runs(id),
+    item_id          TEXT NOT NULL,
+    outcome          TEXT NOT NULL CHECK(outcome IN ('merged','wont_fix','conflict','error')),
+    merge_sha        TEXT,
+    files_changed    INTEGER,
+    lines_added      INTEGER,
+    lines_removed    INTEGER,
+    completed_at     TEXT NOT NULL,
+    cycle_time_s     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_exec_item ON gate_executions(item_id);
+CREATE INDEX IF NOT EXISTS idx_gate_exec_run ON gate_executions(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_item ON agent_events(item_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_model ON agent_events(model);
+CREATE INDEX IF NOT EXISTS idx_diff_stats_item ON diff_stats(item_id);
+CREATE INDEX IF NOT EXISTS idx_diff_stats_file ON diff_stats(file_path);
+CREATE INDEX IF NOT EXISTS idx_complete_item ON complete_events(item_id);
+CREATE INDEX IF NOT EXISTS idx_items_status ON items(final_status);
+CREATE INDEX IF NOT EXISTS idx_gate_runs_item ON gate_runs(item_id);
+"
+  echo ":: Telemetry database initialized at $DB_PATH" >&2
+}
+
+# Insert a gate_runs row and return the new row ID
+insert_run() {
+  local item_id="$1"
+  local agent="$2"
+  local stage="$3"
+  local attempt="$4"
+  local gate_weight="$5"
+  local parent_run_id="$6"
+  local outcome="$7"
+  local started_at="$8"
+  local finished_at="${9:-}"
+  local duration_ms="${10:-}"
+  local context_tokens="${11:-}"
+
+  local escaped_item_id escaped_agent escaped_stage escaped_outcome escaped_started escaped_finished
+  escaped_item_id=$(printf '%s' "$item_id" | sed "s/'/''/g")
+  escaped_agent=$(printf '%s' "$agent" | sed "s/'/''/g")
+  escaped_stage=$(printf '%s' "$stage" | sed "s/'/''/g")
+  escaped_outcome=$(printf '%s' "$outcome" | sed "s/'/''/g")
+  escaped_started=$(printf '%s' "$started_at" | sed "s/'/''/g")
+  escaped_finished=$(printf '%s' "$finished_at" | sed "s/'/''/g")
+
+  local parent_val="NULL"
+  [[ -n "$parent_run_id" ]] && parent_val="$parent_run_id"
+
+  local finished_val="NULL"
+  [[ -n "$finished_at" ]] && finished_val="'$escaped_finished'"
+
+  local duration_val="NULL"
+  [[ -n "$duration_ms" ]] && duration_val="$duration_ms"
+
+  local tokens_val="NULL"
+  [[ -n "$context_tokens" ]] && tokens_val="$context_tokens"
+
+  local id
+  id=$(sql_returning "
+INSERT INTO gate_runs (item_id, agent, stage, attempt, gate_weight, parent_run_id, outcome, started_at, finished_at, duration_ms, context_tokens)
+VALUES ('$escaped_item_id', '$escaped_agent', '$escaped_stage', $attempt, '$gate_weight', $parent_val, '$escaped_outcome', '$escaped_started', $finished_val, $duration_val, $tokens_val);
+SELECT last_insert_rowid();
+")
+  echo "$id"
+}
+
+# Insert a dimension_scores row (one per evaluator dimension per run)
+insert_score() {
+  local run_id="$1"
+  local dimension="$2"
+  local score="$3"
+  local confidence="$4"
+  local band="$5"
+  local evaluator="$6"
+
+  local escaped_dimension escaped_evaluator
+  escaped_dimension=$(printf '%s' "$dimension" | sed "s/'/''/g")
+  escaped_evaluator=$(printf '%s' "$evaluator" | sed "s/'/''/g")
+
+  sql "
+INSERT INTO dimension_scores (run_id, dimension, score, confidence, band, evaluator)
+VALUES ($run_id, '$escaped_dimension', $score, $confidence, '$band', '$escaped_evaluator');
+"
+}
+
+# Insert a rejections row with tier, code, and optional file/line location
+insert_rejection() {
+  local run_id="$1"
+  local tier="$2"
+  local code="$3"
+  local dimension="${4:-}"
+  local detail="$5"
+  local file_path="${6:-}"
+  local line_no="${7:-}"
+
+  local escaped_code escaped_detail escaped_dimension escaped_file_path
+  escaped_code=$(printf '%s' "$code" | sed "s/'/''/g")
+  escaped_detail=$(printf '%s' "$detail" | sed "s/'/''/g")
+  escaped_dimension=$(printf '%s' "$dimension" | sed "s/'/''/g")
+  escaped_file_path=$(printf '%s' "$file_path" | sed "s/'/''/g")
+
+  local dimension_val="NULL"
+  [[ -n "$dimension" ]] && dimension_val="'$escaped_dimension'"
+
+  local file_val="NULL"
+  [[ -n "$file_path" ]] && file_val="'$escaped_file_path'"
+
+  local line_val="NULL"
+  [[ -n "$line_no" ]] && line_val="$line_no"
+
+  sql "
+INSERT INTO rejections (run_id, tier, code, dimension, detail, file_path, line_no)
+VALUES ($run_id, '$tier', '$escaped_code', $dimension_val, '$escaped_detail', $file_val, $line_val);
+"
+}
+
+# Insert a gate_checks row (per-check result within a gate layer)
+insert_check() {
+  local run_id="$1"
+  local layer="$2"
+  local check_name="$3"
+  local outcome="$4"
+  local detail="${5:-}"
+
+  local escaped_check escaped_detail
+  escaped_check=$(printf '%s' "$check_name" | sed "s/'/''/g")
+  escaped_detail=$(printf '%s' "$detail" | sed "s/'/''/g")
+
+  local detail_val="NULL"
+  [[ -n "$detail" ]] && detail_val="'$escaped_detail'"
+
+  sql "
+INSERT INTO gate_checks (run_id, layer, check_name, outcome, detail)
+VALUES ($run_id, $layer, '$escaped_check', '$outcome', $detail_val);
+"
+}
+
+# Pass-through for arbitrary SQL queries
+query_db() {
+  local query="$1"
+  sql_returning "$query"
+}
+
+# Insert or replace an items row, preserving lifecycle fields and incrementing total_attempts
+upsert_item() {
+  local id="$1"
+  local title="$2"
+  local priority="$3"
+  local file_count="$4"
+  local sensitivity="$5"
+  local agent="$6"
+  local gate_weight="$7"
+
+  local escaped_id escaped_title escaped_sensitivity escaped_agent escaped_gate_weight
+  escaped_id=$(printf '%s' "$id" | sed "s/'/''/g")
+  escaped_title=$(printf '%s' "$title" | sed "s/'/''/g")
+  escaped_sensitivity=$(printf '%s' "$sensitivity" | sed "s/'/''/g")
+  escaped_agent=$(printf '%s' "$agent" | sed "s/'/''/g")
+  escaped_gate_weight=$(printf '%s' "$gate_weight" | sed "s/'/''/g")
+
+  local priority_val="NULL"
+  [[ -n "$priority" ]] && priority_val="$priority"
+
+  local file_count_val="NULL"
+  [[ -n "$file_count" ]] && file_count_val="$file_count"
+
+  local sensitivity_val="NULL"
+  [[ -n "$sensitivity" ]] && sensitivity_val="'$escaped_sensitivity'"
+
+  local agent_val="NULL"
+  [[ -n "$agent" ]] && agent_val="'$escaped_agent'"
+
+  local gate_weight_val="NULL"
+  [[ -n "$gate_weight" ]] && gate_weight_val="'$escaped_gate_weight'"
+
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  sql "
+INSERT OR REPLACE INTO items (id, title, priority, file_count, sensitivity, agent, gate_weight, first_resolved_at, completed_at, final_status, total_attempts, cycle_time_s)
+VALUES (
+  '$escaped_id',
+  '$escaped_title',
+  $priority_val,
+  $file_count_val,
+  $sensitivity_val,
+  $agent_val,
+  $gate_weight_val,
+  COALESCE((SELECT first_resolved_at FROM items WHERE id = '$escaped_id'), '$now'),
+  (SELECT completed_at FROM items WHERE id = '$escaped_id'),
+  (SELECT final_status FROM items WHERE id = '$escaped_id'),
+  COALESCE((SELECT total_attempts FROM items WHERE id = '$escaped_id'), 0) + 1,
+  (SELECT cycle_time_s FROM items WHERE id = '$escaped_id')
+);
+"
+}
+
+# Insert a gate_executions row (gate run start) and return the new row ID
+insert_gate_execution() {
+  local run_id="$1"
+  local item_id="$2"
+  local gate_weight="$3"
+  local started_at="$4"
+
+  local escaped_item_id escaped_gate_weight escaped_started
+  escaped_item_id=$(printf '%s' "$item_id" | sed "s/'/''/g")
+  escaped_gate_weight=$(printf '%s' "$gate_weight" | sed "s/'/''/g")
+  escaped_started=$(printf '%s' "$started_at" | sed "s/'/''/g")
+
+  local run_id_val="NULL"
+  [[ -n "$run_id" ]] && run_id_val="$run_id"
+
+  local id
+  id=$(sql_returning "
+INSERT INTO gate_executions (run_id, item_id, gate_weight, started_at)
+VALUES ($run_id_val, '$escaped_item_id', '$escaped_gate_weight', '$escaped_started');
+SELECT last_insert_rowid();
+")
+  echo "$id"
+}
+
+# Finalize a gate_executions row with outcome, timing, check counts, and escalation
+update_gate_execution() {
+  local exec_id="$1"
+  local outcome="$2"
+  local finished_at="$3"
+  local duration_ms="$4"
+  local failed_layer="$5"
+  local checks_total="$6"
+  local checks_passed="$7"
+  local checks_failed="$8"
+  local checks_skipped="$9"
+  local escalated_weight="${10:-}"
+
+  local escaped_outcome escaped_finished escaped_escalated
+  escaped_outcome=$(printf '%s' "$outcome" | sed "s/'/''/g")
+  escaped_finished=$(printf '%s' "$finished_at" | sed "s/'/''/g")
+  escaped_escalated=$(printf '%s' "$escalated_weight" | sed "s/'/''/g")
+
+  local finished_val="NULL"
+  [[ -n "$finished_at" ]] && finished_val="'$escaped_finished'"
+
+  local duration_val="NULL"
+  [[ -n "$duration_ms" ]] && duration_val="$duration_ms"
+
+  local failed_layer_val="NULL"
+  [[ -n "$failed_layer" ]] && failed_layer_val="$failed_layer"
+
+  local checks_total_val="NULL"
+  [[ -n "$checks_total" ]] && checks_total_val="$checks_total"
+
+  local checks_passed_val="NULL"
+  [[ -n "$checks_passed" ]] && checks_passed_val="$checks_passed"
+
+  local checks_failed_val="NULL"
+  [[ -n "$checks_failed" ]] && checks_failed_val="$checks_failed"
+
+  local checks_skipped_val="NULL"
+  [[ -n "$checks_skipped" ]] && checks_skipped_val="$checks_skipped"
+
+  local escalated_val="NULL"
+  [[ -n "$escalated_weight" ]] && escalated_val="'$escaped_escalated'"
+
+  sql "
+UPDATE gate_executions SET
+  outcome = '$escaped_outcome',
+  finished_at = $finished_val,
+  duration_ms = $duration_val,
+  failed_layer = $failed_layer_val,
+  checks_total = $checks_total_val,
+  checks_passed = $checks_passed_val,
+  checks_failed = $checks_failed_val,
+  checks_skipped = $checks_skipped_val,
+  escalated_weight = $escalated_val
+WHERE id = $exec_id;
+"
+}
+
+# Insert an agent_events row with token usage, timing, and outcome
+insert_agent_event() {
+  local run_id="$1"
+  local item_id="$2"
+  local agent="$3"
+  local model="$4"
+  local started_at="$5"
+  local finished_at="${6:-}"
+  local duration_ms="${7:-}"
+  local input_tokens="${8:-}"
+  local output_tokens="${9:-}"
+  local total_tokens="${10:-}"
+  local cache_read="${11:-}"
+  local cache_write="${12:-}"
+  local tokens_per_sec="${13:-}"
+  local tool_uses="${14:-}"
+  local outcome="${15:-}"
+
+  local escaped_item_id escaped_agent escaped_model escaped_started escaped_finished escaped_outcome
+  escaped_item_id=$(printf '%s' "$item_id" | sed "s/'/''/g")
+  escaped_agent=$(printf '%s' "$agent" | sed "s/'/''/g")
+  escaped_model=$(printf '%s' "$model" | sed "s/'/''/g")
+  escaped_started=$(printf '%s' "$started_at" | sed "s/'/''/g")
+  escaped_finished=$(printf '%s' "$finished_at" | sed "s/'/''/g")
+  escaped_outcome=$(printf '%s' "$outcome" | sed "s/'/''/g")
+
+  local run_id_val="NULL"
+  [[ -n "$run_id" ]] && run_id_val="$run_id"
+
+  local agent_val="NULL"
+  [[ -n "$agent" ]] && agent_val="'$escaped_agent'"
+
+  local model_val="NULL"
+  [[ -n "$model" ]] && model_val="'$escaped_model'"
+
+  local finished_val="NULL"
+  [[ -n "$finished_at" ]] && finished_val="'$escaped_finished'"
+
+  local duration_val="NULL"
+  [[ -n "$duration_ms" ]] && duration_val="$duration_ms"
+
+  local input_tokens_val="NULL"
+  [[ -n "$input_tokens" ]] && input_tokens_val="$input_tokens"
+
+  local output_tokens_val="NULL"
+  [[ -n "$output_tokens" ]] && output_tokens_val="$output_tokens"
+
+  local total_tokens_val="NULL"
+  [[ -n "$total_tokens" ]] && total_tokens_val="$total_tokens"
+
+  local cache_read_val="NULL"
+  [[ -n "$cache_read" ]] && cache_read_val="$cache_read"
+
+  local cache_write_val="NULL"
+  [[ -n "$cache_write" ]] && cache_write_val="$cache_write"
+
+  local tokens_per_sec_val="NULL"
+  [[ -n "$tokens_per_sec" ]] && tokens_per_sec_val="$tokens_per_sec"
+
+  local tool_uses_val="NULL"
+  [[ -n "$tool_uses" ]] && tool_uses_val="$tool_uses"
+
+  local outcome_val="NULL"
+  [[ -n "$outcome" ]] && outcome_val="'$escaped_outcome'"
+
+  local id
+  id=$(sql_returning "
+INSERT INTO agent_events (run_id, item_id, agent, model, started_at, finished_at, duration_ms, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_per_sec, tool_uses, outcome)
+VALUES ($run_id_val, '$escaped_item_id', $agent_val, $model_val, '$escaped_started', $finished_val, $duration_val, $input_tokens_val, $output_tokens_val, $total_tokens_val, $cache_read_val, $cache_write_val, $tokens_per_sec_val, $tool_uses_val, $outcome_val);
+SELECT last_insert_rowid();
+")
+  echo "$id"
+}
+
+# Insert a diff_stats row (per-file lines added/removed for a gate execution)
+insert_diff_stat() {
+  local gate_exec_id="$1"
+  local item_id="$2"
+  local file_path="$3"
+  local lines_added="$4"
+  local lines_removed="$5"
+  local is_new="$6"
+  local is_deleted="$7"
+
+  local escaped_item_id escaped_file_path
+  escaped_item_id=$(printf '%s' "$item_id" | sed "s/'/''/g")
+  escaped_file_path=$(printf '%s' "$file_path" | sed "s/'/''/g")
+
+  sql "
+INSERT INTO diff_stats (gate_execution_id, item_id, file_path, lines_added, lines_removed, is_new, is_deleted)
+VALUES ($gate_exec_id, '$escaped_item_id', '$escaped_file_path', $lines_added, $lines_removed, $is_new, $is_deleted);
+"
+}
+
+# Insert a complete_events row with merge SHA, diff summary, and cycle time
+insert_complete_event() {
+  local run_id="$1"
+  local item_id="$2"
+  local outcome="$3"
+  local completed_at="$4"
+  local merge_sha="${5:-}"
+  local files_changed="${6:-}"
+  local lines_added="${7:-}"
+  local lines_removed="${8:-}"
+  local cycle_time_s="${9:-}"
+
+  local escaped_item_id escaped_outcome escaped_completed escaped_merge_sha
+  escaped_item_id=$(printf '%s' "$item_id" | sed "s/'/''/g")
+  escaped_outcome=$(printf '%s' "$outcome" | sed "s/'/''/g")
+  escaped_completed=$(printf '%s' "$completed_at" | sed "s/'/''/g")
+  escaped_merge_sha=$(printf '%s' "$merge_sha" | sed "s/'/''/g")
+
+  local run_id_val="NULL"
+  [[ -n "$run_id" ]] && run_id_val="$run_id"
+
+  local merge_sha_val="NULL"
+  [[ -n "$merge_sha" ]] && merge_sha_val="'$escaped_merge_sha'"
+
+  local files_changed_val="NULL"
+  [[ -n "$files_changed" ]] && files_changed_val="$files_changed"
+
+  local lines_added_val="NULL"
+  [[ -n "$lines_added" ]] && lines_added_val="$lines_added"
+
+  local lines_removed_val="NULL"
+  [[ -n "$lines_removed" ]] && lines_removed_val="$lines_removed"
+
+  local cycle_time_val="NULL"
+  [[ -n "$cycle_time_s" ]] && cycle_time_val="$cycle_time_s"
+
+  local id
+  id=$(sql_returning "
+INSERT INTO complete_events (run_id, item_id, outcome, completed_at, merge_sha, files_changed, lines_added, lines_removed, cycle_time_s)
+VALUES ($run_id_val, '$escaped_item_id', '$escaped_outcome', '$escaped_completed', $merge_sha_val, $files_changed_val, $lines_added_val, $lines_removed_val, $cycle_time_val);
+SELECT last_insert_rowid();
+")
+  echo "$id"
+}
+
+# --- main ---
+
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || die "Usage: $0 <init|insert-run|insert-score|insert-rejection|insert-check|upsert-item|insert-gate-exec|update-gate-exec|insert-agent-event|insert-diff-stat|insert-complete|query> [args...]"
+
+  case "$cmd" in
+    init)
+      init_db
+      ;;
+    insert-run)
+      [[ $# -ge 9 ]] || die "Usage: $0 insert-run <item_id> <agent> <stage> <attempt> <gate_weight> <parent_run_id> <outcome> <started_at> [finished_at] [duration_ms] [context_tokens]"
+      insert_run "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}" "${9}" "${10:-}" "${11:-}" "${12:-}"
+      ;;
+    insert-score)
+      [[ $# -ge 7 ]] || die "Usage: $0 insert-score <run_id> <dimension> <score> <confidence> <band> <evaluator>"
+      insert_score "${2}" "${3}" "${4}" "${5}" "${6}" "${7}"
+      ;;
+    insert-rejection)
+      [[ $# -ge 6 ]] || die "Usage: $0 insert-rejection <run_id> <tier> <code> <dimension> <detail> [file_path] [line_no]"
+      insert_rejection "${2}" "${3}" "${4}" "${5}" "${6}" "${7:-}" "${8:-}"
+      ;;
+    insert-check)
+      [[ $# -ge 5 ]] || die "Usage: $0 insert-check <run_id> <layer> <check_name> <outcome> [detail]"
+      insert_check "${2}" "${3}" "${4}" "${5}" "${6:-}"
+      ;;
+    upsert-item)
+      [[ $# -ge 8 ]] || die "Usage: $0 upsert-item <id> <title> <priority> <file_count> <sensitivity> <agent> <gate_weight>"
+      upsert_item "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}"
+      ;;
+    insert-gate-exec)
+      [[ $# -ge 5 ]] || die "Usage: $0 insert-gate-exec <run_id> <item_id> <gate_weight> <started_at>"
+      insert_gate_execution "${2}" "${3}" "${4}" "${5}"
+      ;;
+    update-gate-exec)
+      [[ $# -ge 10 ]] || die "Usage: $0 update-gate-exec <exec_id> <outcome> <finished_at> <duration_ms> <failed_layer> <checks_total> <checks_passed> <checks_failed> <checks_skipped> [escalated_weight]"
+      update_gate_execution "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}" "${9}" "${10}" "${11:-}"
+      ;;
+    insert-agent-event)
+      [[ $# -ge 6 ]] || die "Usage: $0 insert-agent-event <run_id> <item_id> <agent> <model> <started_at> [finished_at] [duration_ms] [input_tokens] [output_tokens] [total_tokens] [cache_read] [cache_write] [tokens_per_sec] [tool_uses] [outcome]"
+      insert_agent_event "${2}" "${3}" "${4}" "${5}" "${6}" "${7:-}" "${8:-}" "${9:-}" "${10:-}" "${11:-}" "${12:-}" "${13:-}" "${14:-}" "${15:-}" "${16:-}"
+      ;;
+    insert-diff-stat)
+      [[ $# -ge 8 ]] || die "Usage: $0 insert-diff-stat <gate_exec_id> <item_id> <file_path> <lines_added> <lines_removed> <is_new> <is_deleted>"
+      insert_diff_stat "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}"
+      ;;
+    insert-complete)
+      [[ $# -ge 5 ]] || die "Usage: $0 insert-complete <run_id> <item_id> <outcome> <completed_at> [merge_sha] [files_changed] [lines_added] [lines_removed] [cycle_time_s]"
+      insert_complete_event "${2}" "${3}" "${4}" "${5}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" "${10:-}"
+      ;;
+    query)
+      [[ $# -ge 2 ]] || die "Usage: $0 query <sql>"
+      query_db "${2}"
+      ;;
+    *)
+      die "Unknown command: $cmd. Valid: init, insert-run, insert-score, insert-rejection, insert-check, upsert-item, insert-gate-exec, update-gate-exec, insert-agent-event, insert-diff-stat, insert-complete, query"
+      ;;
+  esac
+}
+
+main "$@"

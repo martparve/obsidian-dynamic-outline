@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# track - Feature stage tracking
+#
+# Records which pipeline stages are complete for each feature. Each feature gets
+# a .track file in factory/tracking/ with lines of the form "stage:timestamp".
+#
+# Usage:
+#   ./track                        Show all tracked features
+#   ./track <feature>              Show stages for one feature
+#   ./track <feature> <stage>      Mark stage complete (idempotent)
+#   ./track --reset <feature> <stage>  Remove a stage completion record
+#
+# Called by: complete (marks stages done after merge), prereq (reads stage data)
+# Reads:    factory/tracking/*.track
+# Writes:   factory/tracking/<feature>.track
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+TRACKING_DIR="$FACTORY_DIR/tracking"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Create tracking directory if it doesn't exist
+ensure_tracking_dir() {
+  mkdir -p "$TRACKING_DIR"
+}
+
+# Return the path to a feature's tracking file
+get_track_file() {
+  local feature="$1"
+  echo "$TRACKING_DIR/${feature}.track"
+}
+
+# Display all tracked features and their completed stages
+show_all() {
+  ensure_tracking_dir
+  local found=false
+  for track_file in "$TRACKING_DIR"/*.track; do
+    [[ -f "$track_file" ]] || continue
+    found=true
+    local feature
+    feature=$(basename "$track_file" .track)
+    echo ":: $feature"
+    while IFS=: read -r stage date; do
+      echo "  $stage: $date"
+    done < "$track_file"
+    echo ""
+  done
+  if [[ "$found" == "false" ]]; then
+    echo ":: No tracked features yet." >&2
+  fi
+}
+
+# Display completed stages for a single feature
+show_feature() {
+  local feature="$1"
+  local track_file
+  track_file=$(get_track_file "$feature")
+  if [[ ! -f "$track_file" ]]; then
+    echo ":: No tracking data for $feature" >&2
+    return 0
+  fi
+  echo ":: $feature"
+  while IFS=: read -r stage date; do
+    echo "  $stage: $date"
+  done < "$track_file"
+}
+
+# Append a stage completion record (idempotent - skips if already marked)
+mark_stage() {
+  local feature="$1" stage="$2"
+  ensure_tracking_dir
+  local track_file
+  track_file=$(get_track_file "$feature")
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  if [[ -f "$track_file" ]] && grep -q "^${stage}:" "$track_file" 2>/dev/null; then
+    echo ":: Stage $stage already marked for $feature" >&2
+    return 0
+  fi
+
+  echo "${stage}:${timestamp}" >> "$track_file"
+  echo ":: Marked $feature $stage done at $timestamp" >&2
+}
+
+# Remove a stage completion record from the tracking file
+reset_stage() {
+  local feature="$1" stage="$2"
+  local track_file
+  track_file=$(get_track_file "$feature")
+  if [[ ! -f "$track_file" ]]; then
+    echo ":: No tracking data for $feature" >&2
+    return 0
+  fi
+
+  # BSD sed (macOS) requires '' after -i; GNU sed does not
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' "/^${stage}:/d" "$track_file"
+  else
+    sed -i "/^${stage}:/d" "$track_file"
+  fi
+  echo ":: Reset $feature $stage" >&2
+}
+
+# --- main ---
+
+main() {
+  local arg1="${1:-}"
+
+  if [[ -z "$arg1" ]]; then
+    show_all
+    return 0
+  fi
+
+  if [[ "$arg1" == "--reset" ]]; then
+    local feature="${2:-}"
+    local stage="${3:-}"
+    [[ -n "$feature" ]] || die "Usage: $0 --reset <feature> <stage>"
+    [[ -n "$stage" ]] || die "Usage: $0 --reset <feature> <stage>"
+    reset_stage "$feature" "$stage"
+    return 0
+  fi
+
+  local feature="$arg1"
+  local stage="${2:-}"
+
+  if [[ -z "$stage" ]]; then
+    show_feature "$feature"
+  else
+    mark_stage "$feature" "$stage"
+  fi
+}
+
+main "$@"

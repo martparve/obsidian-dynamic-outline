@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# complete - Pipeline exit: merges worktree branch, records telemetry, cleans up
+#
+# After an agent run passes the gate, this script merges the fix/ branch back
+# into the default branch using rebase-then-merge (no-ff). Serialized via a
+# mkdir-based merge lock to prevent concurrent merge conflicts. Handles three
+# completion modes: normal merge, wont-fix (no merge, terminal state), and
+# no-branch (status update only). Idempotent - detects post-merge crashes and
+# resumes from where it left off.
+#
+# Called by: operator after ./gate passes, or by ./run in autonomous mode
+# Calls: ./db (telemetry updates, completion events)
+# Requires: .runs/<item_id>.json with gate_result="pass" (set by ./gate)
+#
+# Usage:
+#   ./complete FM-001                    # Normal merge
+#   ./complete FM-001 --wont-fix         # Terminal state, no merge
+#   ./complete FM-001 --no-branch fixed  # Status update only, no branch ops
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+IN_PROGRESS="$FACTORY_DIR/.in-progress"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+MERGE_LOCK="$FACTORY_DIR/.merge.lock"
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Write a one-time commit token that the pre-commit hook will consume
+generate_commit_token() {
+  mkdir -p "$RUNS_DIR"
+  python3 -c "import secrets; print(secrets.token_hex(16))" > "$RUNS_DIR/.commit-token"
+}
+
+# Determine the default branch (origin/HEAD, then main, then master)
+detect_default_branch() {
+  local branch
+  branch=$(git -C "$PROJECT_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -n "$branch" ]] && { echo "$branch"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify main >/dev/null 2>&1 && { echo "main"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify master >/dev/null 2>&1 && { echo "master"; return; }
+  echo "main"
+}
+
+DEFAULT_BRANCH=$(detect_default_branch)
+
+# Read a scalar field from YAML frontmatter in a backlog item
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Read a list field (YAML dash-items) from YAML frontmatter
+get_list_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | sed -n "/^${field}:$/,/^[^ ]/p" | grep '^ *- ' | sed 's/^ *- *//' || true
+}
+
+# Replace a scalar field value in YAML frontmatter (in-place)
+set_field() {
+  local file="$1" field="$2" value="$3"
+  if grep -q "^${field}:" "$file"; then
+    sed -i '' "s/^${field}:.*/${field}: ${value}/" "$file"
+  fi
+}
+
+# Read a field from .runs/<item_id>.json
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || return 0
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Remove an item from the .in-progress file
+remove_from_in_progress() {
+  local item_id="$1"
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  grep -v "^${item_id}	" "$IN_PROGRESS" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$IN_PROGRESS"
+}
+
+# Detect completion state for idempotent re-runs: normal, post-merge-crash, or no-artifacts
+check_idempotent() {
+  local item_id="$1"
+
+  local branch_exists
+  branch_exists=$(git -C "$PROJECT_ROOT" branch --list "fix/${item_id}" 2>/dev/null)
+
+  local merge_exists
+  merge_exists=$(git -C "$PROJECT_ROOT" log --grep="merge(${item_id})" --oneline "$DEFAULT_BRANCH" 2>/dev/null | head -1)
+
+  if [[ -z "$branch_exists" ]] && [[ -n "$merge_exists" ]]; then
+    echo "post-merge-crash"
+    return
+  fi
+
+  if [[ -z "$branch_exists" ]] && [[ -z "$merge_exists" ]]; then
+    echo "no-artifacts"
+    return
+  fi
+
+  echo "normal"
+}
+
+# Rebase fix/ branch onto default, then merge --no-ff (serialized via mkdir lock)
+do_merge() {
+  local item_id="$1" item_title="$2"
+  local worktree
+  worktree=$(get_run_field "$item_id" "worktree")
+  [[ -n "$worktree" ]] || worktree="/tmp/${item_id}"
+
+  mkdir "$MERGE_LOCK" 2>/dev/null || die "Another merge is running (could not acquire merge lock)"
+
+  local merge_result="OK"
+
+  if [[ -d "$worktree" ]]; then
+    git -C "$worktree" rebase "$DEFAULT_BRANCH" >/dev/null 2>&1 || {
+      echo ":: Rebase conflict detected for $item_id" >&2
+      git -C "$worktree" rebase --abort 2>/dev/null || true
+      merge_result="CONFLICT"
+    }
+  fi
+
+  if [[ "$merge_result" == "OK" ]]; then
+    # Generate one-time token so the pre-commit hook allows this merge commit
+    generate_commit_token
+    git -C "$PROJECT_ROOT" merge --no-ff "fix/${item_id}" \
+      -m "merge(${item_id}): ${item_title}" >/dev/null 2>&1 || {
+      echo ":: Merge failed for $item_id" >&2
+      merge_result="CONFLICT"
+    }
+  fi
+
+  rmdir "$MERGE_LOCK" 2>/dev/null
+  echo "$merge_result"
+}
+
+# Remove worktree and delete the fix/ branch
+cleanup_git() {
+  local item_id="$1"
+  local worktree
+  worktree=$(get_run_field "$item_id" "worktree")
+  [[ -n "$worktree" ]] || worktree="/tmp/${item_id}"
+
+  if [[ -d "$worktree" ]]; then
+    git -C "$PROJECT_ROOT" worktree remove --force "$worktree" 2>/dev/null || true
+  fi
+
+  local branch_exists
+  branch_exists=$(git -C "$PROJECT_ROOT" branch --list "fix/${item_id}" 2>/dev/null)
+  if [[ -n "$branch_exists" ]]; then
+    git -C "$PROJECT_ROOT" branch -d "fix/${item_id}" 2>/dev/null || \
+    git -C "$PROJECT_ROOT" branch -D "fix/${item_id}" 2>/dev/null || true
+  fi
+}
+
+# Update the gate_runs outcome and finished_at for this item's run
+record_outcome() {
+  local item_id="$1" outcome="$2"
+  [[ -f "$DB_PATH" ]] || return 0
+
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id")
+  [[ -n "$run_id" ]] || return 0
+
+  "$FACTORY_DIR/db" query \
+    "UPDATE gate_runs SET outcome='$outcome', finished_at=datetime('now') WHERE id=$run_id;" 2>/dev/null || true
+}
+
+# Insert a complete_event with merge SHA, diff stats, and cycle time
+record_completion() {
+  local item_id="$1" outcome="$2"
+  [[ -f "$DB_PATH" ]] || return 0
+
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id")
+  [[ -n "$run_id" ]] || run_id=0
+
+  local merge_sha="" files_changed="" lines_added="" lines_removed="" cycle_time_s=""
+  local now
+  now=$(date '+%Y-%m-%dT%H:%M:%S')
+
+  if [[ "$outcome" == "merged" ]]; then
+    merge_sha=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+    local shortstat
+    shortstat=$(git -C "$PROJECT_ROOT" log -1 --format="" --shortstat HEAD 2>/dev/null || echo "")
+    files_changed=$(echo "$shortstat" | grep -o '[0-9]* file' | grep -o '[0-9]*' || echo 0)
+    lines_added=$(echo "$shortstat" | grep -o '[0-9]* insertion' | grep -o '[0-9]*' || echo 0)
+    lines_removed=$(echo "$shortstat" | grep -o '[0-9]* deletion' | grep -o '[0-9]*' || echo 0)
+  fi
+
+  # Cycle time = wall-clock from first resolve to completion (across retries)
+  local first_resolved
+  first_resolved=$("$FACTORY_DIR/db" query \
+    "SELECT first_resolved_at FROM items WHERE id='$item_id';" 2>/dev/null || echo "")
+  if [[ -n "$first_resolved" ]]; then
+    local start_epoch end_epoch
+    start_epoch=$(date -jf '%Y-%m-%dT%H:%M:%SZ' "$first_resolved" '+%s' 2>/dev/null || \
+                  date -d "$first_resolved" '+%s' 2>/dev/null || echo "")
+    end_epoch=$(date '+%s')
+    if [[ -n "$start_epoch" ]]; then
+      cycle_time_s=$(( end_epoch - start_epoch ))
+    fi
+  fi
+
+  "$FACTORY_DIR/db" insert-complete "$run_id" "$item_id" "$outcome" "$now" \
+    "$merge_sha" "$files_changed" "$lines_added" "$lines_removed" "$cycle_time_s" 2>/dev/null || true
+
+  # Update items table lifecycle
+  if [[ "$outcome" == "merged" || "$outcome" == "wont_fix" ]]; then
+    local final_status="$outcome"
+    [[ "$outcome" == "merged" ]] && final_status="fixed"
+    [[ "$outcome" == "wont_fix" ]] && final_status="wont-fix"
+    "$FACTORY_DIR/db" query \
+      "UPDATE items SET completed_at='$now', final_status='$final_status', cycle_time_s=${cycle_time_s:-0} WHERE id='$item_id';" 2>/dev/null || true
+  fi
+}
+
+# Update the item's YAML status field and commit the change
+update_status() {
+  local item_id="$1" new_status="$2"
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || return 0
+  set_field "$item_file" "status" "$new_status"
+  git -C "$PROJECT_ROOT" add "$item_file" 2>/dev/null || true
+  # Generate one-time token so the pre-commit hook allows this status commit
+  generate_commit_token
+  git -C "$PROJECT_ROOT" commit -m "status(${item_id}): ${new_status}" 2>/dev/null || true
+}
+
+# Sync engine files to factory/ copy in a self-hosted factory
+sync_self_hosted() {
+  # Self-hosted = both $PROJECT_ROOT/bin/ and $PROJECT_ROOT/factory/bin/ exist
+  [[ -d "$PROJECT_ROOT/factory/bin" ]] || return 0
+  [[ -d "$PROJECT_ROOT/bin" ]] || return 0
+
+  local synced=0
+
+  # Sync all bin/ scripts to factory/bin/
+  local src_file
+  for src_file in "$PROJECT_ROOT/bin/"*; do
+    [[ -f "$src_file" ]] || continue
+    local basename
+    basename=$(basename "$src_file")
+    local dest="$PROJECT_ROOT/factory/bin/$basename"
+    if [[ ! -f "$dest" ]] || ! diff -q "$src_file" "$dest" >/dev/null 2>&1; then
+      cp "$src_file" "$dest"
+      synced=$((synced + 1))
+    fi
+  done
+
+  # Sync meta/test to factory/meta/test
+  if [[ -f "$PROJECT_ROOT/meta/test" ]]; then
+    mkdir -p "$PROJECT_ROOT/factory/meta"
+    if [[ ! -f "$PROJECT_ROOT/factory/meta/test" ]] || ! diff -q "$PROJECT_ROOT/meta/test" "$PROJECT_ROOT/factory/meta/test" >/dev/null 2>&1; then
+      cp "$PROJECT_ROOT/meta/test" "$PROJECT_ROOT/factory/meta/test"
+      synced=$((synced + 1))
+    fi
+  fi
+
+  # Sync meta/contribute to factory/meta/contribute
+  if [[ -f "$PROJECT_ROOT/meta/contribute" ]]; then
+    mkdir -p "$PROJECT_ROOT/factory/meta"
+    if [[ ! -f "$PROJECT_ROOT/factory/meta/contribute" ]] || ! diff -q "$PROJECT_ROOT/meta/contribute" "$PROJECT_ROOT/factory/meta/contribute" >/dev/null 2>&1; then
+      cp "$PROJECT_ROOT/meta/contribute" "$PROJECT_ROOT/factory/meta/contribute"
+      synced=$((synced + 1))
+    fi
+  fi
+
+  # Redeploy pre-commit hook if install-templates version differs
+  if [[ -f "$PROJECT_ROOT/install-templates/git-hooks/pre-commit" ]]; then
+    local hook_dest="$PROJECT_ROOT/.git/hooks/pre-commit"
+    if [[ ! -f "$hook_dest" ]] || ! diff -q "$PROJECT_ROOT/install-templates/git-hooks/pre-commit" "$hook_dest" >/dev/null 2>&1; then
+      cp "$PROJECT_ROOT/install-templates/git-hooks/pre-commit" "$hook_dest"
+      chmod +x "$hook_dest"
+      synced=$((synced + 1))
+    fi
+  fi
+
+  if [[ "$synced" -gt 0 ]]; then
+    generate_commit_token
+    git -C "$PROJECT_ROOT" add factory/bin/ factory/meta/ 2>/dev/null || true
+    git -C "$PROJECT_ROOT" commit --amend --no-edit 2>/dev/null || true
+    echo ":: Self-hosted sync: $synced files updated" >&2
+  fi
+}
+
+# Delete the .runs/<item_id>.json context file
+cleanup_runs() {
+  local item_id="$1"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] && rm -f "$runs_file"
+}
+
+# Check if all items in the same epic are now completed
+check_epic_completion() {
+  local item_file="$1"
+  local epic
+  epic=$(get_field "$item_file" "epic" 2>/dev/null || true)
+  [[ -n "$epic" ]] || return 0
+
+  local all_done=true
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    local f_epic
+    f_epic=$(get_field "$f" "epic" 2>/dev/null || true)
+    [[ "$f_epic" == "$epic" ]] || continue
+    local f_status
+    f_status=$(get_field "$f" "status")
+    if [[ "$f_status" != "fixed" ]] && [[ "$f_status" != "wont-fix" ]]; then
+      all_done=false
+      break
+    fi
+  done
+
+  if [[ "$all_done" == "true" ]]; then
+    echo ":: Epic $epic complete - all items fixed or wont-fix" >&2
+  fi
+}
+
+# Verify that gate_result=pass in the run context (gate must pass before complete)
+check_gate_passed() {
+  local item_id="$1"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "Gate has not passed for $item_id. Run ./factory/gate first."
+  local gate_result
+  gate_result=$(python3 -c "
+import json
+data = json.load(open('$runs_file'))
+print(data.get('gate_result', ''))
+" 2>/dev/null || echo "")
+  [[ "$gate_result" == "pass" ]] || die "Gate has not passed for $item_id. Run ./factory/gate first."
+}
+
+# Normal completion: verify gate, merge, record telemetry, clean up, update status
+do_complete() {
+  local item_id="$1"
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Backlog item not found: $item_file"
+
+  check_gate_passed "$item_id"
+
+  local title
+  title=$(get_field "$item_file" "title")
+
+  local state
+  state=$(check_idempotent "$item_id")
+
+  case "$state" in
+    post-merge-crash)
+      echo ":: Post-merge crash recovery for $item_id" >&2
+      echo ":: Merge already in main. Updating tracking." >&2
+      ;;
+    no-artifacts)
+      die "$item_id: no branch and no merge commit found. Marking as crash."
+      ;;
+    normal)
+      local empty_diff
+      empty_diff=$(git -C "$PROJECT_ROOT" diff "$DEFAULT_BRANCH"..."fix/${item_id}" --name-only 2>/dev/null)
+      if [[ -z "$empty_diff" ]]; then
+        echo ":: Empty diff for $item_id - no changes to merge" >&2
+        record_outcome "$item_id" "pass"
+      else
+        echo ":: Merging $item_id" >&2
+        local result
+        result=$(do_merge "$item_id" "$title")
+        if [[ "$result" == "CONFLICT" ]]; then
+          echo ":: Merge failed. Branch fix/${item_id} preserved. Resolve conflict or cherry-pick commits manually." >&2
+          record_completion "$item_id" "conflict"
+          # Clean up worktree (it's a copy; the branch has the commits)
+          local wt
+          wt=$(get_run_field "$item_id" "worktree")
+          [[ -n "$wt" ]] || wt="/tmp/${item_id}"
+          if [[ -d "$wt" ]]; then
+            git -C "$PROJECT_ROOT" worktree remove --force "$wt" 2>/dev/null || true
+          fi
+          # Free the concurrency slot so other items can proceed
+          remove_from_in_progress "$item_id"
+          exit 1
+        fi
+      fi
+      ;;
+  esac
+
+  record_completion "$item_id" "merged"
+
+  cleanup_git "$item_id"
+  sync_self_hosted
+  update_status "$item_id" "fixed"
+  remove_from_in_progress "$item_id"
+  record_outcome "$item_id" "pass"
+  cleanup_runs "$item_id"
+  check_epic_completion "$item_file"
+
+  echo ":: $item_id completed and merged." >&2
+}
+
+# Mark item as wont-fix: no merge, clean up branch/worktree, unblock dependents
+do_wont_fix() {
+  local item_id="$1"
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Backlog item not found: $item_file"
+
+  echo ":: Marking $item_id as wont-fix" >&2
+
+  cleanup_git "$item_id"
+  update_status "$item_id" "wont-fix"
+  record_completion "$item_id" "wont_fix"
+  remove_from_in_progress "$item_id"
+  record_outcome "$item_id" "pass"
+  cleanup_runs "$item_id"
+
+  echo ":: $item_id marked wont-fix. Downstream items unblocked." >&2
+}
+
+# Status-only update with no branch or merge operations
+do_no_branch() {
+  local item_id="$1" status="$2"
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Backlog item not found: $item_file"
+
+  update_status "$item_id" "$status"
+  remove_from_in_progress "$item_id"
+  cleanup_runs "$item_id"
+
+  echo ":: $item_id status updated to $status (no-branch mode)" >&2
+}
+
+# --- main ---
+
+main() {
+  local item_id="${1:-}"
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id> [--wont-fix|--no-branch <status>]"
+
+  local mode="${2:-}"
+
+  case "$mode" in
+    --wont-fix)
+      do_wont_fix "$item_id"
+      ;;
+    --no-branch)
+      local status="${3:-fixed}"
+      do_no_branch "$item_id" "$status"
+      ;;
+    "")
+      do_complete "$item_id"
+      ;;
+    *)
+      die "Unknown option: $mode. Valid: --wont-fix, --no-branch <status>"
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,732 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# onboard - Auto-detect language and populate factory.json from actual codebase
+#
+# Scans a project directory to detect language, build/test/lint commands,
+# import patterns, and package dependencies, then writes everything into
+# factory.json. Also builds the import allowlist and package allowlist by
+# scanning actual source files and manifest files.
+#
+# Detection strategy:
+#   1. Count source files by extension (.swift, .py, .ts, .go, .rs)
+#   2. Fall back to manifest files (Package.swift, pyproject.toml, etc.)
+#   3. Detect commands from conventional tooling (Makefile, package.json scripts)
+#   4. Set import patterns and gate checks per language
+#   5. Scan all source files to build the imports allowlist
+#   6. Parse manifests to build the packages allowlist
+#
+# Relationships:
+#   - Called by: install (with --auto-onboard flag), or user manually
+#   - Requires: factory.json must exist (run install first)
+#   - Writes to: factory.json (commands, imports.allowed, packages.allowed, etc.)
+#   - Replaces legacy quality/allowed-imports.json and quality/allowed-packages.json
+#
+# Usage:
+#   ./onboard /path/to/project            # Detect and populate factory.json
+#   ./install /path/to/project --auto-onboard  # Install + onboard in one step
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Directories excluded from all file scans
+EXCLUDE_DIRS=(-path '*/factory/*' -o -path '*/.git/*' -o -path '*/node_modules/*' -o -path '*/.venv/*' -o -path '*/__pycache__/*' -o -path '*/build/*' -o -path '*/dist/*')
+
+# Count source files with the given extension, excluding non-project directories
+count_files() {
+  local target="$1" ext="$2"
+  find "$target" \( "${EXCLUDE_DIRS[@]}" \) -prune -o -name "*${ext}" -type f -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Identify the project language by counting source files; fall back to manifests
+detect_language() {
+  local target="$1"
+
+  local swift_count py_count ts_count go_count rs_count
+  swift_count=$(count_files "$target" ".swift")
+  py_count=$(count_files "$target" ".py")
+
+  local tsx_count jsx_count js_count
+  ts_count=$(count_files "$target" ".ts")
+  tsx_count=$(count_files "$target" ".tsx")
+  js_count=$(count_files "$target" ".js")
+  jsx_count=$(count_files "$target" ".jsx")
+  ts_count=$((ts_count + tsx_count + js_count + jsx_count))
+
+  go_count=$(count_files "$target" ".go")
+  rs_count=$(count_files "$target" ".rs")
+
+  local best_lang="generic" best_count=0
+  local best_detail=""
+
+  if [[ "$swift_count" -gt "$best_count" ]]; then
+    best_lang="swift"; best_count=$swift_count; best_detail="$swift_count .swift files"
+  fi
+  if [[ "$py_count" -gt "$best_count" ]]; then
+    best_lang="python"; best_count=$py_count; best_detail="$py_count .py files"
+  fi
+  if [[ "$ts_count" -gt "$best_count" ]]; then
+    best_lang="typescript"; best_count=$ts_count; best_detail="$ts_count .ts/.tsx/.js/.jsx files"
+  fi
+  if [[ "$go_count" -gt "$best_count" ]]; then
+    best_lang="go"; best_count=$go_count; best_detail="$go_count .go files"
+  fi
+  if [[ "$rs_count" -gt "$best_count" ]]; then
+    best_lang="rust"; best_count=$rs_count; best_detail="$rs_count .rs files"
+  fi
+
+  # Manifest tiebreakers when no source files found or count is tied
+  if [[ "$best_count" -eq 0 ]]; then
+    if [[ -f "$target/Package.swift" ]]; then
+      best_lang="swift"; best_detail="Package.swift found"
+    elif [[ -f "$target/pyproject.toml" ]]; then
+      best_lang="python"; best_detail="pyproject.toml found"
+    elif [[ -f "$target/go.mod" ]]; then
+      best_lang="go"; best_detail="go.mod found"
+    elif [[ -f "$target/Cargo.toml" ]]; then
+      best_lang="rust"; best_detail="Cargo.toml found"
+    elif [[ -f "$target/package.json" ]]; then
+      best_lang="typescript"; best_detail="package.json found"
+    fi
+  else
+    # Append manifest info if present
+    case "$best_lang" in
+      swift)    [[ -f "$target/Package.swift" ]]  && best_detail="$best_detail, Package.swift found" ;;
+      python)   [[ -f "$target/pyproject.toml" ]] && best_detail="$best_detail, pyproject.toml found" ;;
+      typescript) [[ -f "$target/package.json" ]] && best_detail="$best_detail, package.json found" ;;
+      go)       [[ -f "$target/go.mod" ]]         && best_detail="$best_detail, go.mod found" ;;
+      rust)     [[ -f "$target/Cargo.toml" ]]     && best_detail="$best_detail, Cargo.toml found" ;;
+    esac
+  fi
+
+  DETECTED_LANG="$best_lang"
+  DETECTED_LANG_DETAIL="$best_detail"
+}
+
+# Extract project name from git remote URL, falling back to directory name
+detect_project_name() {
+  local target="$1"
+  local name=""
+
+  # Try git remote origin URL first
+  local remote_url
+  remote_url=$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)
+  if [[ -n "$remote_url" ]]; then
+    # Extract repo name from URL (handles both HTTPS and SSH)
+    name=$(basename "$remote_url" .git)
+  fi
+
+  # Fall back to directory basename
+  if [[ -z "$name" ]]; then
+    name=$(basename "$target")
+  fi
+
+  DETECTED_NAME="$name"
+}
+
+# Detect build, test, and lint commands from language conventions and config files
+detect_commands() {
+  local target="$1" language="$2"
+
+  DETECTED_BUILD=""
+  DETECTED_TEST=""
+  DETECTED_LINT=""
+
+  case "$language" in
+    python)
+      # Test command
+      if [[ -f "$target/uv.lock" ]]; then
+        DETECTED_TEST="uv run pytest"
+      else
+        DETECTED_TEST="pytest"
+      fi
+      # Lint command
+      if [[ -f "$target/.ruff.toml" ]] || [[ -f "$target/ruff.toml" ]]; then
+        DETECTED_LINT="ruff check ."
+      elif [[ -f "$target/pyproject.toml" ]] && grep -q 'ruff' "$target/pyproject.toml" 2>/dev/null; then
+        DETECTED_LINT="ruff check ."
+      fi
+      ;;
+    swift)
+      if [[ -f "$target/Package.swift" ]]; then
+        DETECTED_BUILD="swift build"
+        DETECTED_TEST="swift test"
+      fi
+      if [[ -f "$target/.swiftlint.yml" ]]; then
+        DETECTED_LINT="swiftlint"
+      fi
+      ;;
+    typescript)
+      if [[ -f "$target/package.json" ]]; then
+        # Read scripts from package.json via python3
+        local scripts
+        scripts=$(python3 -c "
+import json, sys
+try:
+    pkg = json.load(open('$target/package.json'))
+    scripts = pkg.get('scripts', {})
+    print(scripts.get('build', ''))
+    print(scripts.get('test', ''))
+    print(scripts.get('lint', ''))
+except Exception:
+    print('')
+    print('')
+    print('')
+" 2>/dev/null || printf '\n\n\n')
+        local build_script test_script lint_script
+        build_script=$(echo "$scripts" | sed -n '1p')
+        test_script=$(echo "$scripts" | sed -n '2p')
+        lint_script=$(echo "$scripts" | sed -n '3p')
+
+        if [[ -n "$build_script" ]]; then
+          DETECTED_BUILD="npm run build"
+        fi
+        if [[ -n "$test_script" ]]; then
+          DETECTED_TEST="npm test"
+        fi
+        if [[ -n "$lint_script" ]]; then
+          DETECTED_LINT="npm run lint"
+        fi
+      fi
+      ;;
+    go)
+      DETECTED_BUILD="go build ./..."
+      DETECTED_TEST="go test ./..."
+      if [[ -f "$target/.golangci.yml" ]] || [[ -f "$target/.golangci.yaml" ]] || [[ -f "$target/.golangci.toml" ]]; then
+        DETECTED_LINT="golangci-lint run"
+      fi
+      ;;
+    rust)
+      DETECTED_BUILD="cargo build"
+      DETECTED_TEST="cargo test"
+      DETECTED_LINT="cargo clippy"
+      ;;
+    generic)
+      # Check Makefile for targets
+      if [[ -f "$target/Makefile" ]]; then
+        if grep -q '^build:' "$target/Makefile" 2>/dev/null; then
+          DETECTED_BUILD="make build"
+        fi
+        if grep -q '^test:' "$target/Makefile" 2>/dev/null; then
+          DETECTED_TEST="make test"
+        fi
+        if grep -q '^lint:' "$target/Makefile" 2>/dev/null; then
+          DETECTED_LINT="make lint"
+        fi
+      fi
+      ;;
+  esac
+}
+
+# Set the import regex pattern and file extensions for the detected language
+detect_imports_config() {
+  local language="$1"
+
+  case "$language" in
+    python)
+      DETECTED_IMPORT_PATTERN='^(?:import|from)\s+(\S+)'
+      DETECTED_FILE_EXTENSIONS='[".py"]'
+      ;;
+    swift)
+      DETECTED_IMPORT_PATTERN='^import\s+(\S+)'
+      DETECTED_FILE_EXTENSIONS='[".swift"]'
+      ;;
+    typescript)
+      DETECTED_IMPORT_PATTERN="^import\s+.*from\s+['\"]([^'\"]+)"
+      DETECTED_FILE_EXTENSIONS='[".ts", ".tsx"]'
+      ;;
+    go)
+      DETECTED_IMPORT_PATTERN='^\s*"([^"]+)"'
+      DETECTED_FILE_EXTENSIONS='[".go"]'
+      ;;
+    rust)
+      DETECTED_IMPORT_PATTERN='^use\s+(\S+)'
+      DETECTED_FILE_EXTENSIONS='[".rs"]'
+      ;;
+    *)
+      DETECTED_IMPORT_PATTERN=''
+      DETECTED_FILE_EXTENSIONS='[]'
+      ;;
+  esac
+}
+
+# Set the manifest filename and dependency pattern for the detected language
+detect_packages_config() {
+  local language="$1" target="$2"
+
+  case "$language" in
+    python)
+      DETECTED_MANIFEST="pyproject.toml"
+      DETECTED_DEP_PATTERN="dependencies"
+      ;;
+    swift)
+      DETECTED_MANIFEST="Package.swift"
+      DETECTED_DEP_PATTERN='\.package\('
+      ;;
+    typescript)
+      DETECTED_MANIFEST="package.json"
+      DETECTED_DEP_PATTERN="dependencies"
+      ;;
+    go)
+      DETECTED_MANIFEST="go.mod"
+      DETECTED_DEP_PATTERN="require"
+      ;;
+    rust)
+      DETECTED_MANIFEST="Cargo.toml"
+      DETECTED_DEP_PATTERN='\[dependencies\]'
+      ;;
+    *)
+      DETECTED_MANIFEST=""
+      DETECTED_DEP_PATTERN=""
+      ;;
+  esac
+}
+
+# Set Layer 2 gate checks appropriate for the language (e.g., @MainActor for Swift)
+detect_gate_config() {
+  local language="$1"
+
+  case "$language" in
+    swift)
+      DETECTED_LAYER2='["mainactor", "fetch_descriptor", "ats_bypass", "secrets", "shared_capability"]'
+      ;;
+    python)
+      DETECTED_LAYER2='["secrets", "shared_capability"]'
+      ;;
+    *)
+      DETECTED_LAYER2='["secrets"]'
+      ;;
+  esac
+}
+
+# Write all detected settings into factory.json, only filling empty fields
+merge_into_factory_json() {
+  local factory_json="$1"
+
+  # Build detected values as JSON and pass via stdin to avoid
+  # shell interpolation issues with regex patterns and quotes
+  python3 - "$factory_json" "$DETECTED_NAME" "$DETECTED_BUILD" "$DETECTED_TEST" "$DETECTED_LINT" "$DETECTED_IMPORT_PATTERN" "$DETECTED_FILE_EXTENSIONS" "$DETECTED_MANIFEST" "$DETECTED_DEP_PATTERN" "$DETECTED_LAYER2" << 'PYEOF'
+import json, sys
+
+args = sys.argv[1:]
+factory_json_path = args[0]
+name = args[1]
+build_cmd = args[2]
+test_cmd = args[3]
+lint_cmd = args[4]
+import_pattern = args[5]
+file_extensions = json.loads(args[6]) if args[6] else []
+manifest = args[7]
+dep_pattern = args[8]
+layer2_checks = json.loads(args[9]) if args[9] else []
+
+with open(factory_json_path) as f:
+    config = json.load(f)
+
+def set_if_empty(obj, key, value, empty_vals=('', None)):
+    current = obj.get(key)
+    if current in empty_vals or current == []:
+        obj[key] = value
+
+# Project
+proj = config.setdefault('project', {})
+set_if_empty(proj, 'name', name)
+if file_extensions:
+    set_if_empty(proj, 'file_extensions', file_extensions)
+
+# Commands
+cmds = config.setdefault('commands', {})
+set_if_empty(cmds, 'build', build_cmd)
+set_if_empty(cmds, 'test', test_cmd)
+set_if_empty(cmds, 'lint', lint_cmd)
+
+# Imports
+imp = config.setdefault('imports', {})
+set_if_empty(imp, 'pattern', import_pattern)
+if file_extensions:
+    set_if_empty(imp, 'file_extensions', file_extensions)
+
+# Packages
+pkg = config.setdefault('packages', {})
+set_if_empty(pkg, 'manifest', manifest)
+set_if_empty(pkg, 'new_dep_pattern', dep_pattern)
+
+# Gate - upgrade from default ["secrets"] but don't clobber custom config
+gate = config.setdefault('gate', {})
+current_layer2 = gate.get('layer2_checks', [])
+if not current_layer2 or current_layer2 == ['secrets']:
+    gate['layer2_checks'] = layer2_checks
+
+with open(factory_json_path, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYEOF
+}
+
+# Python standard library module names for distinguishing stdlib from third-party
+PYTHON_STDLIB="abc argparse array ast asyncio base64 bisect bz2 cgi collections configparser contextlib copy csv ctypes dataclasses datetime decimal difflib dis email enum errno fcntl filecmp fnmatch fractions ftplib functools gc getopt getpass gettext glob gzip hashlib heapq hmac html http imaplib importlib inspect io ipaddress itertools json keyword linecache locale logging lzma mailbox math mimetypes mmap multiprocessing numbers operator os pathlib pdb pickle platform plistlib poplib pprint profile pstats py_compile queue random re readline reprlib rlcompleter runpy sched secrets select selectors shelve shlex shutil signal site smtplib socket socketserver sqlite3 ssl stat statistics string struct subprocess sys sysconfig syslog tempfile test textwrap threading time timeit token tokenize tomllib traceback tracemalloc tty turtle types typing unicodedata unittest urllib uuid venv warnings wave weakref webbrowser xml xmlrpc zipfile zipimport zlib"
+
+# Known Apple frameworks for distinguishing first-party from third-party imports
+APPLE_FRAMEWORKS="Foundation SwiftUI SwiftData UIKit AppKit CoreData CoreLocation CoreGraphics CoreImage CoreML ARKit RealityKit Combine Observation os MapKit AVFoundation Photos PhotosUI CloudKit WebKit GameKit SpriteKit SceneKit StoreKit Metal MetalKit Vision NaturalLanguage CreateML Accelerate Security CryptoKit Network MultipeerConnectivity CoreBluetooth CoreMotion CoreHaptics AuthenticationServices WidgetKit ActivityKit AppIntents SwiftCharts Charts TipKit GroupActivities"
+
+# Write an imports allowlist JSON blob into factory.json's imports.allowed key
+write_imports_to_factory_json() {
+  local factory_json="$1" imports_json="$2"
+  python3 -c "
+import json, sys
+fj_path = sys.argv[1]
+imports_data = json.loads(sys.argv[2])
+with open(fj_path) as f:
+    fj = json.load(f)
+fj.setdefault('imports', {})['allowed'] = imports_data
+with open(fj_path, 'w') as f:
+    json.dump(fj, f, indent=2)
+    f.write('\n')
+" "$factory_json" "$imports_json" 2>/dev/null || true
+}
+
+# Scan all source files for import statements, classify, and write to factory.json
+scan_imports() {
+  local target="$1" language="$2"
+  local factory_json="$target/factory/factory.json"
+
+  case "$language" in
+    python)
+      local all_imports
+      all_imports=$(find "$target" \( "${EXCLUDE_DIRS[@]}" \) -prune -o -name '*.py' -type f -print0 2>/dev/null | \
+        xargs -0 grep -h '^\(import \|from \)' 2>/dev/null | \
+        sed 's/^import //; s/^from \([^ ]*\).*/\1/' | \
+        cut -d. -f1 | sort -u || true)
+
+      local stdlib_imports=() thirdparty_imports=()
+      while IFS= read -r imp; do
+        [[ -n "$imp" ]] || continue
+        if echo "$PYTHON_STDLIB" | tr ' ' '\n' | grep -qx "$imp"; then
+          stdlib_imports+=("$imp")
+        elif [[ ! -d "$target/$imp" ]]; then
+          thirdparty_imports+=("$imp")
+        fi
+      done <<< "$all_imports"
+
+      local all_allowed=()
+      all_allowed+=("${stdlib_imports[@]}")
+      all_allowed+=("${thirdparty_imports[@]}")
+
+      local imports_json
+      imports_json=$(python3 -c "
+import json, sys
+allowed = sys.argv[1:]
+data = {'domain': {'allowed': sorted(allowed), 'banned': []}}
+print(json.dumps(data))
+" "${all_allowed[@]}" 2>/dev/null || echo '{}')
+      write_imports_to_factory_json "$factory_json" "$imports_json"
+
+      local stdlib_count=${#stdlib_imports[@]}
+      local tp_count=${#thirdparty_imports[@]}
+      echo "  Imports: $stdlib_count stdlib, $tp_count third-party -> factory.json imports.allowed" >&2
+      ;;
+
+    swift)
+      local all_imports
+      all_imports=$(find "$target" \( "${EXCLUDE_DIRS[@]}" \) -prune -o -name '*.swift' -type f -print0 2>/dev/null | \
+        xargs -0 grep -h '^import ' 2>/dev/null | \
+        sed 's/^import //' | tr -d ' ' | sort -u || true)
+
+      local apple_imports=() thirdparty_imports=()
+      local has_swiftui=false
+      while IFS= read -r imp; do
+        [[ -n "$imp" ]] || continue
+        if echo "$APPLE_FRAMEWORKS" | tr ' ' '\n' | grep -qx "$imp"; then
+          apple_imports+=("$imp")
+          [[ "$imp" == "SwiftUI" ]] && has_swiftui=true
+        else
+          thirdparty_imports+=("$imp")
+        fi
+      done <<< "$all_imports"
+
+      local imports_json
+      if [[ "$has_swiftui" == "true" ]]; then  # Split into domain vs views layers
+        local domain_imports=() views_imports=()
+        for imp in "${apple_imports[@]}"; do
+          case "$imp" in
+            SwiftUI|UIKit|AppKit|MapKit|Charts|SwiftCharts)
+              views_imports+=("$imp") ;;
+            *)
+              domain_imports+=("$imp") ;;
+          esac
+        done
+        domain_imports+=("${thirdparty_imports[@]}")
+
+        imports_json=$(python3 -c "
+import json, sys
+domain = sorted(sys.argv[1].split(',')) if sys.argv[1] else []
+views = sorted(sys.argv[2].split(',')) if sys.argv[2] else []
+data = {
+    'domain': {'allowed': domain, 'banned': ['UIKit', 'SwiftUI']},
+    'views': {'allowed': views, 'banned': ['UIKit']}
+}
+print(json.dumps(data))
+" "$(IFS=,; echo "${domain_imports[*]}")" "$(IFS=,; echo "${views_imports[*]}")" 2>/dev/null || echo '{}')
+      else
+        local all_allowed=()
+        all_allowed+=("${apple_imports[@]}")
+        all_allowed+=("${thirdparty_imports[@]}")
+
+        imports_json=$(python3 -c "
+import json, sys
+allowed = sorted(sys.argv[1:])
+data = {'domain': {'allowed': allowed, 'banned': []}}
+print(json.dumps(data))
+" "${all_allowed[@]}" 2>/dev/null || echo '{}')
+      fi
+      write_imports_to_factory_json "$factory_json" "$imports_json"
+
+      local apple_count=${#apple_imports[@]}
+      local tp_count=${#thirdparty_imports[@]}
+      echo "  Imports: $apple_count Apple frameworks, $tp_count third-party -> factory.json imports.allowed" >&2
+      ;;
+
+    typescript)
+      local all_imports
+      all_imports=$(find "$target" \( "${EXCLUDE_DIRS[@]}" \) -prune -o \( -name '*.ts' -o -name '*.tsx' \) -type f -print0 2>/dev/null | \
+        xargs -0 grep -h "from ['\"]" 2>/dev/null | \
+        sed "s/.*from ['\"]//; s/['\"].*//" | sort -u || true)
+
+      local pkg_imports=()
+      while IFS= read -r imp; do
+        [[ -n "$imp" ]] || continue
+        [[ "$imp" == .* ]] && continue  # Skip relative imports
+        local pkg
+        if [[ "$imp" == @* ]]; then
+          pkg=$(echo "$imp" | cut -d/ -f1,2)
+        else
+          pkg=$(echo "$imp" | cut -d/ -f1)
+        fi
+        pkg_imports+=("$pkg")
+      done <<< "$all_imports"
+
+      local unique_imports
+      unique_imports=$(printf '%s\n' "${pkg_imports[@]}" | sort -u)
+
+      local imports_json
+      imports_json=$(python3 -c "
+import json, sys
+allowed = [l.strip() for l in sys.stdin if l.strip()]
+data = {'domain': {'allowed': sorted(allowed), 'banned': []}}
+print(json.dumps(data))
+" <<< "$unique_imports" 2>/dev/null || echo '{}')
+      write_imports_to_factory_json "$factory_json" "$imports_json"
+
+      local imp_count
+      imp_count=$(echo "$unique_imports" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+      echo "  Imports: $imp_count packages -> factory.json imports.allowed" >&2
+      ;;
+
+    go)
+      local all_imports
+      all_imports=$(find "$target" \( "${EXCLUDE_DIRS[@]}" \) -prune -o -name '*.go' -type f -print0 2>/dev/null | \
+        xargs -0 grep -h '"[^"]*"' 2>/dev/null | \
+        sed 's/.*"\([^"]*\)".*/\1/' | sort -u || true)
+
+      local imports_json
+      imports_json=$(python3 -c "
+import json, sys
+allowed = [l.strip() for l in sys.stdin if l.strip()]
+data = {'domain': {'allowed': sorted(allowed), 'banned': []}}
+print(json.dumps(data))
+" <<< "$all_imports" 2>/dev/null || echo '{}')
+      write_imports_to_factory_json "$factory_json" "$imports_json"
+
+      local imp_count
+      imp_count=$(echo "$all_imports" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+      echo "  Imports: $imp_count packages -> factory.json imports.allowed" >&2
+      ;;
+
+    *)
+      echo "  Imports: skipped (no pattern for $language)" >&2
+      ;;
+  esac
+}
+
+# Parse package manifests to extract declared dependencies into factory.json
+scan_packages() {
+  local target="$1" language="$2"
+  local factory_json="$target/factory/factory.json"
+
+  local pkg_names=""
+
+  case "$language" in
+    python)
+      if [[ -f "$target/pyproject.toml" ]]; then
+        pkg_names=$(python3 -c "
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open('$target/pyproject.toml', 'rb') as f:
+    data = tomllib.load(f)
+deps = data.get('project', {}).get('dependencies', [])
+for d in deps:
+    name = d.split('[')[0].split('>')[0].split('<')[0].split('=')[0].split('!')[0].split(';')[0].strip()
+    if name:
+        print(name)
+" 2>/dev/null || true)
+      elif [[ -f "$target/requirements.txt" ]]; then
+        pkg_names=$(grep -v '^\s*#\|^\s*$\|^-' "$target/requirements.txt" 2>/dev/null | \
+          sed 's/[>=<\!;].*//' | tr -d ' ' | sort -u || true)
+      fi
+      ;;
+
+    swift)
+      if [[ -f "$target/Package.swift" ]]; then
+        pkg_names=$(grep -o 'url: *"[^"]*"' "$target/Package.swift" 2>/dev/null | \
+          sed 's/url: *"//; s/"$//' | \
+          while IFS= read -r url; do
+            basename "$url" .git
+          done || true)
+      fi
+      ;;
+
+    typescript)
+      if [[ -f "$target/package.json" ]]; then
+        pkg_names=$(python3 -c "
+import json
+data = json.load(open('$target/package.json'))
+deps = list(data.get('dependencies', {}).keys())
+for d in sorted(deps):
+    print(d)
+" 2>/dev/null || true)
+      fi
+      ;;
+
+    go)
+      if [[ -f "$target/go.mod" ]]; then
+        pkg_names=$(sed -n '/^require/,/^)/p' "$target/go.mod" 2>/dev/null | \
+          grep -v '^require\|^)\|^\s*$' | awk '{print $1}' | sort -u || true)
+      fi
+      ;;
+
+    rust)
+      if [[ -f "$target/Cargo.toml" ]]; then
+        pkg_names=$(sed -n '/\[dependencies\]/,/^\[/p' "$target/Cargo.toml" 2>/dev/null | \
+          grep -v '^\[' | grep '=' | cut -d= -f1 | tr -d ' ' | sort -u || true)
+      fi
+      ;;
+  esac
+
+  if [[ -n "$pkg_names" ]]; then
+    python3 -c "
+import json, sys
+fj_path = sys.argv[1]
+names = [l.strip() for l in sys.stdin if l.strip()]
+with open(fj_path) as f:
+    fj = json.load(f)
+fj.setdefault('packages', {})['allowed'] = [{'name': n} for n in sorted(names)]
+fj['packages'].setdefault('review_required', [])
+with open(fj_path, 'w') as f:
+    json.dump(fj, f, indent=2)
+    f.write('\n')
+" "$factory_json" <<< "$pkg_names" 2>/dev/null || true
+    local pkg_count
+    pkg_count=$(echo "$pkg_names" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+    echo "  Packages: $pkg_count dependencies -> factory.json packages.allowed" >&2
+  else
+    python3 -c "
+import json, sys
+fj_path = sys.argv[1]
+with open(fj_path) as f:
+    fj = json.load(f)
+fj.setdefault('packages', {})['allowed'] = []
+fj['packages'].setdefault('review_required', [])
+with open(fj_path, 'w') as f:
+    json.dump(fj, f, indent=2)
+    f.write('\n')
+" "$factory_json" 2>/dev/null || true
+    echo "  Packages: none found" >&2
+  fi
+}
+
+# Print a summary of all detected settings to stderr
+print_summary() {
+  local target="$1"
+
+  echo ":: Onboarding $target" >&2
+  echo "  Language: $DETECTED_LANG ($DETECTED_LANG_DETAIL)" >&2
+  echo "  Name: $DETECTED_NAME" >&2
+
+  if [[ -n "$DETECTED_BUILD" ]]; then
+    echo "  Build: $DETECTED_BUILD" >&2
+  else
+    echo "  Build: (none)" >&2
+  fi
+
+  if [[ -n "$DETECTED_TEST" ]]; then
+    echo "  Test: $DETECTED_TEST" >&2
+  else
+    echo "  Test: (none)" >&2
+  fi
+
+  if [[ -n "$DETECTED_LINT" ]]; then
+    echo "  Lint: $DETECTED_LINT" >&2
+  else
+    echo "  Lint: (none)" >&2
+  fi
+
+  echo "  Imports: $DETECTED_LANG pattern, $DETECTED_FILE_EXTENSIONS" >&2
+  echo "  Packages: ${DETECTED_MANIFEST:-(none)}" >&2
+  echo "  Gate: $(echo "$DETECTED_LAYER2" | python3 -c "import json,sys; print(', '.join(json.load(sys.stdin)))")" >&2
+}
+
+# --- main ---
+
+main() {
+  local target=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*)
+        die "Unknown flag: $1"
+        ;;
+      *)
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$target" ]] || die "Usage: $0 /path/to/target"
+
+  target=$(cd "$target" 2>/dev/null && pwd) || die "Target path does not exist: $target"
+
+  local factory_json="$target/factory/factory.json"
+  [[ -f "$factory_json" ]] || die "No factory.json at $factory_json. Run install first."
+
+  detect_language "$target"
+  detect_project_name "$target"
+  detect_commands "$target" "$DETECTED_LANG"
+  detect_imports_config "$DETECTED_LANG"
+  detect_packages_config "$DETECTED_LANG" "$target"
+  detect_gate_config "$DETECTED_LANG"
+
+  print_summary "$target"
+
+  echo "" >&2
+  echo ":: Updating $factory_json" >&2
+  merge_into_factory_json "$factory_json"
+  echo "  done" >&2
+
+  echo "" >&2
+  echo ":: Scanning codebase" >&2
+  scan_imports "$target" "$DETECTED_LANG"
+  scan_packages "$target" "$DETECTED_LANG"
+  echo "  done" >&2
+}
+
+main "$@"

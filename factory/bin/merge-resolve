@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# merge-resolve - Handle merge conflicts during complete's rebase step
+#
+# When ./complete encounters a merge conflict during rebase, this script
+# attempts resolution in two ordered steps:
+#
+# Step 1 - Auto-resolve (deterministic):
+#   Handles trivial conflicts automatically. Import-only conflicts in source
+#   files are resolved by stripping conflict markers and deduplicating with
+#   sort -u. If auto-resolve succeeds, runs build/test to verify.
+#
+# Step 2 - Ordered resolution (when auto-resolve fails or gate fails):
+#   a. Validates whether tests still fail against the new baseline.
+#      - ALREADY_RESOLVED: item's changes were superseded, mark as fixed.
+#      - NEEDS_TEST_UPDATE: tests don't compile, needs test-writer first.
+#      - NEEDS_REIMPL: tests fail as expected, emit a builder prompt with
+#        the original diff as reference for re-implementation.
+#
+# Relationships:
+#   - Called by: complete (on rebase conflict), or user manually
+#   - Reads: .runs/<item_id>.json for worktree path
+#   - Calls: validate (--build, --test), complete (--no-branch for ALREADY_RESOLVED)
+#   - Emits: builder agent prompt for re-implementation (between REIMPL markers)
+#
+# Usage:
+#   ./merge-resolve FM-012
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+MERGE_LOCK="$FACTORY_DIR/.merge.lock"
+MAX_REIMPL_ATTEMPTS=2
+MAX_REQUEUE_CYCLES=2
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Determine the default branch (main, master, or from origin/HEAD)
+detect_default_branch() {
+  local branch
+  branch=$(git -C "$PROJECT_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -n "$branch" ]] && { echo "$branch"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify main >/dev/null 2>&1 && { echo "main"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify master >/dev/null 2>&1 && { echo "master"; return; }
+  echo "main"
+}
+
+DEFAULT_BRANCH=$(detect_default_branch)
+
+# Read a dotted key path from factory.json (e.g., "imports.pattern")
+get_config() {
+  local key="$1" default="${2:-}"
+  local config="$FACTORY_DIR/factory.json"
+  [[ -f "$config" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+}
+
+# Check if a file matches the project's configured source extensions
+is_source_file() {
+  local file="$1"
+  local extensions
+  extensions=$(get_config "project.file_extensions")
+  [[ -n "$extensions" ]] || return 1
+  while IFS= read -r ext; do
+    [[ -n "$ext" ]] || continue
+    if [[ "$file" == *"$ext" ]]; then
+      return 0
+    fi
+  done <<< "$extensions"
+  return 1
+}
+
+# Check if a line matches the project's import pattern (from factory.json)
+is_import_line() {
+  local line="$1"
+  local pattern
+  pattern=$(get_config "imports.pattern")
+  [[ -n "$pattern" ]] || return 1
+  python3 -c "
+import re,sys
+pattern = r'$pattern'
+if re.match(pattern, '''$line'''.strip()):
+  sys.exit(0)
+else:
+  sys.exit(1)
+" 2>/dev/null
+}
+
+# Extract a scalar YAML frontmatter field from a markdown file
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Extract a field from the item's runtime JSON (.runs/<item_id>.json)
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || return 0
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Try to resolve conflicts automatically; import-only conflicts get deduped
+auto_resolve() {
+  local worktree="$1"
+  echo ":: Step 1: Auto-resolve (deterministic)" >&2
+
+  local conflict_files
+  conflict_files=$(git -C "$worktree" diff --name-only --diff-filter=U 2>/dev/null)
+  [[ -n "$conflict_files" ]] || { echo "OK"; return; }
+
+  local all_resolved=true
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$worktree/$f"
+    [[ -f "$full_path" ]] || continue
+
+    local has_conflict
+    has_conflict=$(grep -c '^<<<<<<<' "$full_path" 2>/dev/null || echo 0)
+    [[ "$has_conflict" -gt 0 ]] || continue
+
+    if is_source_file "$f"; then
+      local import_pattern
+      import_pattern=$(get_config "imports.pattern")
+      if [[ -n "$import_pattern" ]]; then
+        local import_only=true
+        local in_conflict=false
+        while IFS= read -r line; do
+          if echo "$line" | grep -q '^<<<<<<<'; then
+            in_conflict=true
+            continue
+          fi
+          if echo "$line" | grep -q '^>>>>>>>'; then
+            in_conflict=false
+            continue
+          fi
+          if echo "$line" | grep -q '^======='; then
+            continue
+          fi
+          if [[ "$in_conflict" == "true" ]]; then
+            if ! is_import_line "$line"; then
+              import_only=false
+              break
+            fi
+          fi
+        done < "$full_path"
+
+        if [[ "$import_only" == "true" ]]; then
+          # Strip conflict markers, then deduplicate import lines
+          sed -i '' '/^<<<<<<<.*$/d; /^=======$/d; /^>>>>>>>.*$/d' "$full_path"
+          sort -u -o "$full_path" "$full_path"
+          git -C "$worktree" add "$f" 2>/dev/null
+          echo "  Auto-resolved import conflict in $f" >&2
+          continue
+        fi
+      fi
+    fi
+
+    sed -i '' '/^[[:space:]]*$/d' "$full_path" 2>/dev/null || true
+
+    local remaining
+    remaining=$(grep -c '^<<<<<<<' "$full_path" 2>/dev/null || echo 0)
+    if [[ "$remaining" -gt 0 ]]; then
+      echo "  Cannot auto-resolve: $f ($remaining conflicts remain)" >&2
+      all_resolved=false
+    fi
+  done <<< "$conflict_files"
+
+  if [[ "$all_resolved" == "true" ]]; then
+    git -C "$worktree" rebase --continue 2>/dev/null || true
+    echo "OK"
+  else
+    echo "FAIL"
+  fi
+}
+
+# Check if the item's tests pass/fail against the updated baseline
+validate_tests() {
+  local item_id="$1" worktree="$2"
+  echo ":: Step 2a: Validate tests against new baseline" >&2
+
+  local test_compile
+  test_compile=$("$FACTORY_DIR/validate" --build 2>/dev/null && echo "ok" || echo "fail")
+
+  if [[ "$test_compile" == "fail" ]]; then
+    echo "  Tests don't compile against new baseline" >&2
+    echo "NEEDS_TEST_UPDATE"
+    return
+  fi
+
+  local test_result
+  test_result=$("$FACTORY_DIR/validate" --test 2>/dev/null && echo "pass" || echo "fail")
+
+  if [[ "$test_result" == "pass" ]]; then
+    echo "  Tests pass without item's fix - covered by other changes" >&2
+    echo "ALREADY_RESOLVED"
+    return
+  fi
+
+  echo "  Tests fail as expected - re-implementation needed" >&2
+  echo "NEEDS_REIMPL"
+}
+
+# Emit a builder agent prompt with the original diff as reference context
+emit_reimpl_prompt() {
+  local item_id="$1" worktree="$2"
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Item not found: $item_file"
+
+  local agent_def="$FACTORY_DIR/agents/builder.md"
+  [[ -f "$agent_def" ]] || die "Builder agent not found"
+
+  local prior_diff
+  prior_diff=$(git -C "$PROJECT_ROOT" diff "$DEFAULT_BRANCH"..."fix/${item_id}" --no-color 2>/dev/null || echo "")
+
+  echo "---REIMPL-PROMPT-START---"
+  echo "# Agent Definition"
+  echo ""
+  cat "$agent_def"
+  echo ""
+  echo "---"
+  echo ""
+  echo "# Re-implementation Task"
+  echo ""
+  echo "Item $item_id needs re-implementation due to merge conflict."
+  echo "The codebase has changed since the original implementation."
+  echo ""
+  echo "## Original Item Description"
+  echo ""
+  sed -n '/^---$/,/^---$/!p' "$item_file" | sed '1{/^$/d;}'
+  echo ""
+  echo "## Prior Diff (read-only reference)"
+  echo '```'
+  echo "$prior_diff"
+  echo '```'
+  echo ""
+  echo "## Instructions"
+  echo ""
+  echo "Re-implement the changes for $item_id against the current main."
+  echo "Work in: $worktree"
+  echo "Branch: fix/${item_id}"
+  echo "The prior diff shows what was originally implemented."
+  echo "Adapt it to the current codebase state."
+  echo "---REIMPL-PROMPT-END---"
+}
+
+# --- main ---
+
+main() {
+  local item_id="${1:-}"
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id>"
+
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "No run context for $item_id"
+
+  local worktree
+  worktree=$(get_run_field "$item_id" "worktree")
+  [[ -d "$worktree" ]] || die "Worktree not found: $worktree"
+
+  echo ":: Merge conflict resolution for $item_id" >&2
+
+  local auto_result
+  auto_result=$(auto_resolve "$worktree")
+
+  if [[ "$auto_result" == "OK" ]]; then
+    echo ":: Auto-resolve succeeded. Running build/test gate." >&2
+    if "$FACTORY_DIR/validate" --build 2>/dev/null && "$FACTORY_DIR/validate" --test 2>/dev/null; then
+      echo ":: Auto-resolve passed gate. Ready for complete." >&2
+      exit 0
+    else
+      echo ":: Auto-resolve passed but gate failed. Falling through to step 2." >&2
+    fi
+  fi
+
+  echo ":: Step 2: Ordered resolution" >&2
+
+  local test_status
+  test_status=$(validate_tests "$item_id" "$worktree")
+
+  case "$test_status" in
+    ALREADY_RESOLVED)
+      echo ":: Item $item_id resolved by other changes. Marking no_change." >&2
+      "$FACTORY_DIR/complete" "$item_id" --no-branch "fixed" 2>/dev/null || true
+      exit 0
+      ;;
+    NEEDS_TEST_UPDATE)
+      echo ":: Tests need updating first. Emit test-writer prompt." >&2
+      echo ":: Manual step: run test-writer agent to update tests, then re-run merge-resolve" >&2
+      exit 1
+      ;;
+    NEEDS_REIMPL)
+      echo ":: Re-implementation required." >&2
+      emit_reimpl_prompt "$item_id" "$worktree"
+      echo "" >&2
+      echo ":: Run the builder agent with the prompt above." >&2
+      echo ":: Then re-run: ./gate $item_id && ./complete $item_id" >&2
+      exit 0
+      ;;
+  esac
+}
+
+main "$@"

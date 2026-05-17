@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# sanitize-spec - Strip sensitive paths from behavior specs
+#
+# Reads a behavior spec file and removes file paths from the whitelist section
+# that fall under sensitive directories (defined in context/tiers.json).
+# Removed paths are relocated to a new "Integration Notes" section so the
+# wirer agent can handle them separately with elevated access.
+#
+# This prevents spec-writer and impl agents from seeing paths they should not
+# touch directly (e.g., shared infrastructure, platform integration layers).
+#
+# Usage: ./sanitize-spec <spec_file>
+#
+# Called by: resolve (sanitizes spec before emitting agent prompt)
+# Reads:    context/tiers.json (sensitive directory paths)
+# Writes:   The spec file in-place (moves sensitive paths to integration notes)
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+TIERS_FILE="$FACTORY_DIR/context/tiers.json"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Extract directory paths from tiers.json (first 3 quoted paths ending in /)
+get_sensitive_paths() {
+  grep -o '"[^"]*/"' "$TIERS_FILE" | tr -d '"' | head -3
+}
+
+# Process the spec file: remove sensitive paths from whitelist, add integration notes
+sanitize() {
+  local spec_file="$1"
+  [[ -f "$spec_file" ]] || die "Spec file not found: $spec_file"
+
+  local sensitive_paths
+  sensitive_paths=$(get_sensitive_paths)
+
+  local in_whitelist=false
+  local removed_paths=""
+  local clean_lines=""
+  local integration_notes=""
+
+  while IFS= read -r line; do
+    # Detect the start of a file whitelist section (multiple naming conventions)
+    if echo "$line" | grep -qi "^## whitelist\|^## file.whitelist\|^## files"; then
+      in_whitelist=true
+      clean_lines+="$line"$'\n'
+      continue
+    fi
+
+    # A new H2 section ends the whitelist block
+    if [[ "$in_whitelist" == "true" ]] && echo "$line" | grep -q "^##"; then
+      in_whitelist=false
+    fi
+
+    if [[ "$in_whitelist" == "true" ]] && echo "$line" | grep -q "^- "; then
+      local path
+      path=$(echo "$line" | sed 's/^- //')
+      local is_sensitive=false
+
+      while IFS= read -r sp; do
+        [[ -n "$sp" ]] || continue
+        if echo "$path" | grep -q "^${sp}"; then
+          is_sensitive=true
+          break
+        fi
+      done <<< "$sensitive_paths"
+
+      if [[ "$is_sensitive" == "true" ]]; then
+        removed_paths+="$line"$'\n'
+        integration_notes+="- $path (moved from whitelist - requires wirer agent)"$'\n'
+        echo ":: Removed sensitive path: $path" >&2
+        continue
+      fi
+    fi
+
+    clean_lines+="$line"$'\n'
+  done < "$spec_file"
+
+  if [[ -n "$integration_notes" ]]; then
+    clean_lines+=$'\n'"## Integration Notes (for wirer agent)"$'\n'
+    clean_lines+="$integration_notes"
+  fi
+
+  printf '%s' "$clean_lines" > "$spec_file"
+
+  if [[ -n "$removed_paths" ]]; then
+    echo ":: Sanitized spec: moved sensitive paths to integration notes" >&2
+  else
+    echo ":: Spec clean: no sensitive paths found in whitelist" >&2
+  fi
+}
+
+# --- main ---
+
+main() {
+  local spec_file="${1:-}"
+  [[ -n "$spec_file" ]] || die "Usage: $0 <spec_file>"
+
+  [[ -f "$TIERS_FILE" ]] || die "tiers.json not found at $TIERS_FILE"
+
+  sanitize "$spec_file"
+}
+
+main "$@"

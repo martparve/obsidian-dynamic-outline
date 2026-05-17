@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# install - Deploys factory into target projects (fresh install and --update)
+#
+# Two modes of operation:
+#   Fresh install: copies engine scripts, language-specific templates (agents,
+#     quality configs, factory.json), scaffold directories, context templates,
+#     hooks (Claude and git), .gitignore, CLAUDE.md section, and CONFIG.md.
+#     Refuses if factory.json already exists.
+#   Update (--update): replaces engine files only from .factory-manifest,
+#     deep-merges new fields into factory.json (preserving existing values),
+#     refreshes agent/quality templates, hooks, and CLAUDE.md. Never overwrites
+#     project-owned config.
+#
+# Reads .factory-manifest to distinguish engine files (replaceable) from project
+# files (never overwritten). Engine scripts live in bin/ with backward-compat
+# symlinks at the factory root.
+#
+# Called by: operator during setup or upgrade
+# Calls: ./db init (fresh install), ./onboard (with --auto-onboard)
+#
+# Usage:
+#   ./install /path/to/repo --language swift
+#   ./install /path/to/repo --language python --auto-onboard
+#   ./install /path/to/repo --update
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+MANIFEST="$FACTORY_DIR/.factory-manifest"
+
+# Resolve install-templates directory: check FACTORY_DIR first, then parent
+# (covers self-hosted factory where templates live at the project root)
+if [[ -d "$FACTORY_DIR/install-templates" ]]; then
+  TEMPLATES_DIR="$FACTORY_DIR/install-templates"
+elif [[ -d "$FACTORY_DIR/../install-templates" ]]; then
+  TEMPLATES_DIR="$(cd "$FACTORY_DIR/../install-templates" && pwd)"
+else
+  TEMPLATES_DIR="$FACTORY_DIR/install-templates"
+fi
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Extract file entries under a named section (e.g. "engine", "project") from .factory-manifest
+parse_manifest_section() {
+  local section="$1"
+  local in_section=false
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && { in_section=false; continue; }
+    [[ "$line" =~ ^#.*"$section" ]] && { in_section=true; continue; }
+    [[ "$line" =~ ^# ]] && { in_section=false; continue; }
+    [[ "$in_section" == "true" ]] && echo "$line"
+  done < "$MANIFEST"
+}
+
+# Copy all engine files from manifest to target, create bin/ symlinks for backward compat
+copy_engine() {
+  local target="$1"
+  local copied=0 skipped=0
+
+  # Track bin/ scripts for symlink creation
+  local bin_scripts=()
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    local src="$FACTORY_DIR/$entry"
+    local dst="$target/factory/$entry"
+
+    if [[ "$entry" == */ ]]; then
+      local dir="${entry%/}"
+      local src_clean="${src%/}"
+      if [[ -d "$src_clean" ]]; then
+        mkdir -p "$dst"
+        find "$src_clean" -type f ! -name '.DS_Store' ! -name '__pycache__' | while IFS= read -r f; do
+          local rel="${f#"$src_clean"/}"
+          local fdst="$target/factory/$dir/$rel"
+          mkdir -p "$(dirname "$fdst")"
+          cp -p "$f" "$fdst"
+          copied=$((copied + 1))
+        done
+      fi
+    elif [[ -f "$src" ]]; then
+      mkdir -p "$(dirname "$dst")"
+      cp -p "$src" "$dst"
+      copied=$((copied + 1))
+      # Track bin/ entries for symlink creation
+      if [[ "$entry" == bin/* ]]; then
+        bin_scripts+=("${entry#bin/}")
+      fi
+    else
+      echo "  WARN: engine file not found: $entry" >&2
+      skipped=$((skipped + 1))
+    fi
+  done < <(parse_manifest_section "engine")
+
+  # Create backward-compat symlinks from factory root to bin/
+  for script_name in "${bin_scripts[@]}"; do
+    local link="$target/factory/$script_name"
+    # Remove stale regular file from pre-bin/ installs
+    [[ -L "$link" ]] && rm -f "$link"
+    [[ -f "$link" ]] && rm -f "$link"
+    ln -s "bin/$script_name" "$link"
+  done
+
+  echo "$copied copied, $skipped skipped"
+}
+
+# Create project scaffold directories from the "project" manifest section
+create_scaffold() {
+  local target="$1"
+  local created=0 existed=0
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    local dst="$target/factory/$entry"
+
+    if [[ "$entry" == */ ]]; then
+      if [[ -d "$dst" ]]; then
+        existed=$((existed + 1))
+      else
+        mkdir -p "$dst"
+        created=$((created + 1))
+      fi
+    fi
+  done < <(parse_manifest_section "project")
+
+  echo "$created created, $existed already existed"
+}
+
+# Copy language-specific templates (factory.json, agents, quality) and common templates
+copy_templates() {
+  local target="$1" language="$2"
+  local templates="$TEMPLATES_DIR"
+  local copied=0
+
+  local starter="$templates/factory-${language}.json"
+  if [[ -f "$starter" ]]; then
+    cp "$starter" "$target/factory/factory.json"
+    copied=$((copied + 1))
+  else
+    die "No factory.json template for language: $language"
+  fi
+
+  local agents_src="$templates/agents-${language}"
+  if [[ -d "$agents_src" ]]; then
+    mkdir -p "$target/factory/agents"
+    find "$agents_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$agents_src"/}"
+      local fdst="$target/factory/agents/$rel"
+      mkdir -p "$(dirname "$fdst")"
+      cp -p "$f" "$fdst"
+      copied=$((copied + 1))
+    done
+  fi
+
+  local quality_src="$templates/quality-${language}"
+  if [[ -d "$quality_src" ]]; then
+    mkdir -p "$target/factory/quality"
+    find "$quality_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$quality_src"/}"
+      local fdst="$target/factory/quality/$rel"
+      mkdir -p "$(dirname "$fdst")"
+      cp -p "$f" "$fdst"
+      copied=$((copied + 1))
+    done
+  fi
+
+  local common_src="$templates/quality-common"
+  if [[ -d "$common_src" ]]; then
+    find "$common_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$common_src"/}"
+      local fdst="$target/factory/quality/$rel"
+      mkdir -p "$(dirname "$fdst")"
+      cp -p "$f" "$fdst"
+      copied=$((copied + 1))
+    done
+  fi
+
+  local agents_common_src="$templates/agents-common"
+  if [[ -d "$agents_common_src" ]]; then
+    find "$agents_common_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$agents_common_src"/}"
+      local fdst="$target/factory/agents/$rel"
+      mkdir -p "$(dirname "$fdst")"
+      cp -p "$f" "$fdst"
+      copied=$((copied + 1))
+    done
+  fi
+
+  echo "$copied"
+}
+
+# Create starter context files (module-map.json, atomicity.json, platform-conventions.md)
+create_context_templates() {
+  local target="$1"
+  local ctx="$target/factory/context"
+  mkdir -p "$ctx"
+
+  local templates_created=0
+
+  # tiers.json is now consolidated into factory.json at gate.tiers.
+  # Skip creating standalone file for new installs.
+
+  if [[ ! -f "$ctx/module-map.json" ]]; then
+    cat > "$ctx/module-map.json" <<'JSON'
+{
+  "modules": {}
+}
+JSON
+    templates_created=$((templates_created + 1))
+  fi
+
+  if [[ ! -f "$ctx/atomicity.json" ]]; then
+    cat > "$ctx/atomicity.json" <<'JSON'
+{
+  "groups": []
+}
+JSON
+    templates_created=$((templates_created + 1))
+  fi
+
+  if [[ ! -f "$ctx/platform-conventions.md" ]]; then
+    cat > "$ctx/platform-conventions.md" <<'MD'
+# Platform Conventions
+
+Define your project's coding standards here. This file is included in every agent prompt.
+MD
+    templates_created=$((templates_created + 1))
+  fi
+
+  echo "$templates_created"
+}
+
+# Write factory/.gitignore for runtime artifacts (.runs/, .telemetry.db, locks, etc.)
+create_gitignore() {
+  local target="$1"
+  local gi="$target/factory/.gitignore"
+
+  cat > "$gi" <<'GI'
+.runs/
+.in-progress
+.telemetry.db
+.resolve.lock
+.merge.lock
+.circuit-breaker
+install-templates/
+GI
+}
+
+# Add or replace the "# Factory" section in the target's CLAUDE.md
+update_claude_md() {
+  local target="$1"
+  local claude_md="$target/CLAUDE.md"
+
+  local factory_section
+  factory_section=$(cat <<'SECTION'
+# Factory
+
+This project uses the Code Factory workflow. See `factory/CLAUDE.md` for full documentation.
+
+### Resolving Backlog Items
+
+```bash
+./factory/resolve <item_id>    # or: ./factory/resolve --next
+```
+
+After the agent completes:
+
+```bash
+./factory/complete <item_id>
+```
+
+**Rules:**
+- Never compose agent prompts manually. `./factory/resolve` output IS the prompt.
+- Never skip `./factory/complete`. It tracks progress and prevents drift.
+- Only use factory-defined agents from `factory/agents/`.
+- Max 3 parallel agents.
+- If a factory script fails, errors, or produces unexpected output: STOP. Report the exact error to the user. Never work around it, improvise a manual alternative, or attempt to fix the factory scripts inline. Factory bugs are fixed upstream.
+SECTION
+)
+
+  if [[ ! -f "$claude_md" ]]; then
+    echo "$factory_section" > "$claude_md"
+    echo "created"
+    return
+  fi
+
+  if grep -q '^# Factory' "$claude_md"; then
+    local tmp
+    tmp=$(mktemp)
+    local in_factory=false
+    local replaced=false
+    while IFS= read -r line; do
+      if [[ "$line" == "# Factory" ]]; then
+        in_factory=true
+        replaced=true
+        echo "$factory_section" >> "$tmp"
+        continue
+      fi
+      if [[ "$in_factory" == "true" ]]; then
+        if [[ "$line" =~ ^#\  ]] && [[ "$line" != "### "* ]]; then
+          in_factory=false
+          echo "$line" >> "$tmp"
+        fi
+        continue
+      fi
+      echo "$line" >> "$tmp"
+    done < "$claude_md"
+    mv "$tmp" "$claude_md"
+    echo "replaced"
+  else
+    {
+      echo ""
+      echo "$factory_section"
+    } >> "$claude_md"
+    echo "appended"
+  fi
+}
+
+# Deploy Claude hooks (.claude/hooks/) and git hooks (.git/hooks/), skip non-factory-managed
+deploy_hooks() {
+  local target="$1"
+  local hooks_src="$TEMPLATES_DIR/hooks"
+  local hooks_dst="$target/.claude/hooks"
+  local settings_src="$TEMPLATES_DIR/claude-settings.json"
+  local settings_dst="$target/.claude/settings.json"
+  local git_hooks_src="$TEMPLATES_DIR/git-hooks"
+  local git_hooks_dst="$target/.git/hooks"
+
+  mkdir -p "$hooks_dst"
+
+  # Remove stale hooks before copying new ones
+  find "$hooks_dst" -type f -name '*.sh' -delete 2>/dev/null || true
+
+  if [[ -d "$hooks_src" ]]; then
+    find "$hooks_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$hooks_src"/}"
+      cp -p "$f" "$hooks_dst/$rel"
+      chmod +x "$hooks_dst/$rel"
+    done
+  fi
+
+  if [[ -f "$settings_src" ]]; then
+    mkdir -p "$(dirname "$settings_dst")"
+    cp -p "$settings_src" "$settings_dst"
+  fi
+
+  # Deploy git hooks (pre-commit)
+  if [[ -d "$git_hooks_src" ]] && [[ -d "$target/.git" ]]; then
+    mkdir -p "$git_hooks_dst"
+    find "$git_hooks_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$git_hooks_src"/}"
+      local dst="$git_hooks_dst/$rel"
+      # Only overwrite if factory-managed or doesn't exist
+      if [[ ! -f "$dst" ]] || grep -q '# factory-managed' "$dst" 2>/dev/null; then
+        cp -p "$f" "$dst"
+        chmod +x "$dst"
+      else
+        echo "  WARN: $dst exists and is not factory-managed, skipping" >&2
+      fi
+    done
+  fi
+
+  # Deploy slash commands
+  local commands_src="$TEMPLATES_DIR/commands"
+  local commands_dst="$target/.claude/commands"
+  if [[ -d "$commands_src" ]]; then
+    mkdir -p "$commands_dst"
+    find "$commands_src" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      local rel="${f#"$commands_src"/}"
+      cp -p "$f" "$commands_dst/$rel"
+    done
+  fi
+
+  # Stage .claude/ so hooks are tracked in git (available in worktrees and clones)
+  if [[ -d "$target/.git" ]]; then
+    # Ensure .claude/settings.local.json is gitignored (user-specific overrides)
+    local root_gi="$target/.gitignore"
+    local local_entry=".claude/settings.local.json"
+    if [[ -f "$root_gi" ]]; then
+      if ! grep -qxF "$local_entry" "$root_gi"; then
+        echo "$local_entry" >> "$root_gi"
+      fi
+    else
+      echo "$local_entry" > "$root_gi"
+    fi
+
+    git -C "$target" add .claude/ || echo "  WARN: git add .claude/ failed (non-fatal)" >&2
+    echo ":: Staged .claude/ hooks for commit" >&2
+  fi
+}
+
+# Record the source factory's git SHA in .upstream-sha for update tracking
+record_upstream_sha() {
+  local target="$1"
+  local sha
+  sha=$(git -C "$FACTORY_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+  echo "$sha" > "$target/factory/.upstream-sha"
+}
+
+# Deep-merge new fields from the language template into existing factory.json (preserves values)
+merge_factory_json() {
+  local target="$1" language="$2"
+  local target_fj="$target/factory/factory.json"
+  local template_fj="$TEMPLATES_DIR/factory-${language}.json"
+
+  if [[ ! -f "$template_fj" ]]; then
+    template_fj="$TEMPLATES_DIR/factory-generic.json"
+  fi
+  if [[ ! -f "$template_fj" ]]; then
+    echo "  WARN: no template found, skipping factory.json merge" >&2
+    return
+  fi
+
+  local result
+  result=$(python3 -c "
+import json, sys
+
+def deep_merge(target, template, path=''):
+    added = []
+    for key in template:
+        full = path + '.' + key if path else key
+        if key not in target:
+            target[key] = template[key]
+            added.append(full)
+        elif isinstance(target[key], dict) and isinstance(template[key], dict):
+            added.extend(deep_merge(target[key], template[key], full))
+    return added
+
+with open(sys.argv[1]) as f:
+    tgt = json.load(f)
+with open(sys.argv[2]) as f:
+    tpl = json.load(f)
+
+added = deep_merge(tgt, tpl)
+
+if added:
+    with open(sys.argv[1], 'w') as f:
+        json.dump(tgt, f, indent=2)
+        f.write('\n')
+
+json.dump(added, sys.stdout)
+" "$target_fj" "$template_fj")
+
+  local count
+  count=$(python3 -c "import json,sys; a=json.loads(sys.argv[1]); print(len(a))" "$result")
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  factory.json: no new fields" >&2
+  else
+    echo "  factory.json: $count field(s) added" >&2
+    python3 -c "
+import json, sys
+for f in json.loads(sys.argv[1]):
+    print('    + ' + f, file=sys.stderr)
+" "$result"
+  fi
+}
+
+# Detect project language from file_extensions in factory.json (for --update mode)
+detect_language() {
+  local target="$1"
+  local fj="$target/factory/factory.json"
+  [[ -f "$fj" ]] || { echo "generic"; return; }
+
+  local ext
+  ext=$(grep -o '"\.[a-z]*"' "$fj" | head -1 | tr -d '"' || true)
+  case "$ext" in
+    .swift) echo "swift" ;;
+    .py)    echo "python" ;;
+    .sh)    echo "bash" ;;
+    *)      echo "generic" ;;
+  esac
+}
+
+# --- main ---
+
+# Full install: engine + templates + scaffold + hooks + context + db init + CLAUDE.md
+do_fresh_install() {
+  local target="$1" language="$2"
+
+  if [[ -f "$target/factory/factory.json" ]]; then
+    die "factory.json already exists in $target/factory/. Use --update for engine-only update."
+  fi
+
+  echo ":: Installing factory into $target (language: $language)" >&2
+  echo "" >&2
+
+  mkdir -p "$target/factory"
+
+  echo ":: Copying engine files" >&2
+  local engine_result
+  engine_result=$(copy_engine "$target")
+  echo "  $engine_result" >&2
+
+  echo ":: Copying $language templates" >&2
+  local template_count
+  template_count=$(copy_templates "$target" "$language")
+  echo "  $template_count file(s) copied" >&2
+
+  echo ":: Deploying hooks" >&2
+  deploy_hooks "$target"
+  echo "  done" >&2
+
+  echo ":: Creating scaffold directories" >&2
+  local scaffold_result
+  scaffold_result=$(create_scaffold "$target")
+  echo "  $scaffold_result" >&2
+
+  echo ":: Initializing telemetry database" >&2
+  "$target/factory/db" init 2>/dev/null || echo "  WARN: db init failed (non-fatal)" >&2
+  echo "  done" >&2
+
+  echo ":: Creating context templates" >&2
+  local templates
+  templates=$(create_context_templates "$target")
+  echo "  $templates template(s) created" >&2
+
+  echo ":: Creating .gitignore" >&2
+  create_gitignore "$target"
+  echo "  done" >&2
+
+  echo ":: Updating CLAUDE.md" >&2
+  local claude_result
+  claude_result=$(update_claude_md "$target")
+  echo "  $claude_result" >&2
+
+  echo ":: Deploying CONFIG.md" >&2
+  cp "$TEMPLATES_DIR/config-reference.md" "$target/factory/CONFIG.md"
+  echo "  done" >&2
+
+  echo ":: Recording upstream SHA" >&2
+  record_upstream_sha "$target"
+  echo "  done" >&2
+
+  echo "" >&2
+  echo ":: Factory installed to $target/factory/" >&2
+  echo ":: Next: edit factory/factory.json and factory/context/ files for your project" >&2
+}
+
+# Engine-only update: replace engine files, merge new factory.json fields, refresh hooks
+do_update() {
+  local target="$1"
+
+  if [[ ! -f "$target/factory/factory.json" ]]; then
+    die "No factory.json in $target/factory/. Use fresh install (without --update) first."
+  fi
+
+  echo ":: Updating engine in $target" >&2
+  echo "" >&2
+
+  # Remove regular files left by pre-bin/ installs (they are now symlinks to bin/)
+  local old_scripts=(resolve gate complete run intake cancel score report triage track prereq validate sanitize-spec validate-behavior db merge-resolve install approve onboard test)
+  for s in "${old_scripts[@]}"; do
+    local old_file="$target/factory/$s"
+    # Remove regular files (not symlinks) - these are pre-bin/ installs
+    [[ -f "$old_file" ]] && [[ ! -L "$old_file" ]] && rm -f "$old_file"
+  done
+
+  echo ":: Replacing engine files" >&2
+  local engine_result
+  engine_result=$(copy_engine "$target")
+  echo "  $engine_result" >&2
+
+  if [[ -d "$target/factory/install-templates" ]]; then
+    echo ":: Cleaning up install-templates from target" >&2
+    rm -rf "$target/factory/install-templates"
+  fi
+
+  echo ":: Detecting language" >&2
+  local language
+  language=$(detect_language "$target")
+  echo "  $language" >&2
+
+  echo ":: Merging new template fields into factory.json" >&2
+  merge_factory_json "$target" "$language"
+
+  echo ":: Updating agents and quality from $language templates" >&2
+  # copy_templates overwrites factory.json, so we back it up and restore after
+  local fj_backup
+  fj_backup=$(mktemp)
+  cp -p "$target/factory/factory.json" "$fj_backup"
+  local template_count
+  template_count=$(copy_templates "$target" "$language")
+  cp -p "$fj_backup" "$target/factory/factory.json"
+  rm -f "$fj_backup"
+  echo "  $template_count file(s) copied" >&2
+
+  echo ":: Deploying hooks" >&2
+  deploy_hooks "$target"
+  echo "  done" >&2
+
+  echo ":: Updating CLAUDE.md" >&2
+  local claude_result
+  claude_result=$(update_claude_md "$target")
+  echo "  $claude_result" >&2
+
+  echo ":: Deploying CONFIG.md" >&2
+  cp "$TEMPLATES_DIR/config-reference.md" "$target/factory/CONFIG.md"
+  echo "  done" >&2
+
+  echo ":: Recording upstream SHA" >&2
+  record_upstream_sha "$target"
+  echo "  done" >&2
+
+  echo "" >&2
+  echo ":: Engine updated in $target/factory/" >&2
+  echo ":: Existing factory.json values were preserved; only missing fields were added" >&2
+}
+
+main() {
+  local target="" language="generic" update=false auto_onboard=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --language)
+        [[ -n "${2:-}" ]] || die "--language requires a value (swift, python, generic)"
+        language="$2"
+        shift 2
+        ;;
+      --update)
+        update=true
+        shift
+        ;;
+      --auto-onboard)
+        auto_onboard=true
+        shift
+        ;;
+      -*)
+        die "Unknown flag: $1"
+        ;;
+      *)
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$target" ]] || die "Usage: $0 /path/to/target-repo [--language swift|python|generic] [--auto-onboard] [--update]"
+
+  target=$(cd "$target" 2>/dev/null && pwd) || die "Target path does not exist: $target"
+  [[ -d "$target/.git" ]] || die "Target is not a git repo: $target"
+  [[ -f "$MANIFEST" ]] || die "Missing .factory-manifest at $FACTORY_DIR"
+
+  if [[ "$update" == "true" ]]; then
+    [[ "$auto_onboard" == "false" ]] || die "--auto-onboard cannot be used with --update"
+    do_update "$target"
+  else
+    do_fresh_install "$target" "$language"
+  fi
+
+  if [[ "$auto_onboard" == "true" ]]; then
+    echo "" >&2
+    echo ":: Running auto-onboard scan" >&2
+    "$target/factory/onboard" "$target"
+  fi
+}
+
+main "$@"

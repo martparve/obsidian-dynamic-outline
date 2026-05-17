@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# cancel - Stop an in-flight work item and clean up all artifacts
+#
+# Performs a full teardown of a running item: removes it from the concurrency
+# tracker, records the cancellation in telemetry, deletes the git worktree
+# and branch, removes runtime files, sets the item status to wont-fix, and
+# suspends any downstream items that depend on it.
+#
+# Relationships:
+#   - Reverses what resolve sets up (worktree, branch, .in-progress entry)
+#   - Updates telemetry via the db script (marks gate run as "crash")
+#   - Suspends dependents by setting their status to "blocked"
+#   - Called by: user manually, or by the autonomous run loop on timeout
+#
+# Usage:
+#   ./cancel FM-012
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+IN_PROGRESS="$FACTORY_DIR/.in-progress"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Extract a scalar YAML frontmatter field from a markdown file
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Extract a YAML list field (lines starting with "- ") from frontmatter
+get_list_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | sed -n "/^${field}:$/,/^[^ ]/p" | grep '^ *- ' | sed 's/^ *- *//' || true
+}
+
+# Update a scalar YAML frontmatter field in-place
+set_field() {
+  local file="$1" field="$2" value="$3"
+  if grep -q "^${field}:" "$file"; then
+    sed -i '' "s/^${field}:.*/${field}: ${value}/" "$file"
+  fi
+}
+
+# Remove the item's line from the .in-progress concurrency tracker
+remove_from_in_progress() {
+  local item_id="$1"
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  grep -v "^${item_id}	" "$IN_PROGRESS" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$IN_PROGRESS"
+}
+
+# Mark the active gate run as "crash" in the telemetry database
+record_cancellation() {
+  local item_id="$1"
+  [[ -f "$DB_PATH" ]] || return 0
+
+  local run_id=""
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  if [[ -f "$runs_file" ]]; then
+    run_id=$(grep '"run_id"' "$runs_file" | grep -o '[0-9]*' | head -1)
+  fi
+
+  if [[ -n "$run_id" ]]; then
+    "$FACTORY_DIR/db" query \
+      "UPDATE gate_runs SET outcome='crash', finished_at=datetime('now') WHERE id=$run_id;" 2>/dev/null || true
+  fi
+}
+
+# Remove the git worktree and delete the fix/ branch
+cleanup_git() {
+  local item_id="$1"
+
+  local worktree="/tmp/${item_id}"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  if [[ -f "$runs_file" ]]; then
+    local wt
+    wt=$(grep '"worktree"' "$runs_file" | sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+    [[ -n "$wt" ]] && worktree="$wt"
+  fi
+
+  if [[ -d "$worktree" ]]; then
+    git -C "$PROJECT_ROOT" worktree remove --force "$worktree" 2>/dev/null || true
+  fi
+
+  local branch_exists
+  branch_exists=$(git -C "$PROJECT_ROOT" branch --list "fix/${item_id}" 2>/dev/null)
+  if [[ -n "$branch_exists" ]]; then
+    git -C "$PROJECT_ROOT" branch -D "fix/${item_id}" 2>/dev/null || true
+  fi
+}
+
+# Delete the runtime context file (.runs/<item_id>.json)
+cleanup_runs() {
+  local item_id="$1"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] && rm -f "$runs_file"
+}
+
+# Set status to "blocked" on any open item that depends on the cancelled item
+suspend_dependents() {
+  local item_id="$1"
+  [[ -d "$BACKLOG_DIR" ]] || return 0
+
+  local suspended=0
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    local status
+    status=$(get_field "$f" "status")
+    [[ "$status" == "open" ]] || continue
+
+    local deps
+    deps=$(get_list_field "$f" "depends-on")
+    if echo "$deps" | grep -qx "$item_id" 2>/dev/null; then
+      local dep_id
+      dep_id=$(get_field "$f" "id")
+      set_field "$f" "status" "blocked"
+      echo "  Suspended: $dep_id (depends on $item_id)" >&2
+      suspended=$(( suspended + 1 ))
+    fi
+  done
+
+  if [[ "$suspended" -gt 0 ]]; then
+    echo ":: $suspended downstream items suspended" >&2
+  fi
+}
+
+# --- main ---
+
+main() {
+  local item_id="${1:-}"
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id>"
+
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Backlog item not found: $item_file"
+
+  echo ":: Cancelling $item_id" >&2
+
+  remove_from_in_progress "$item_id"
+  record_cancellation "$item_id"
+  cleanup_git "$item_id"
+  cleanup_runs "$item_id"
+  set_field "$item_file" "status" "wont-fix"
+  suspend_dependents "$item_id"
+
+  echo ":: $item_id cancelled. Worktree and branch cleaned up." >&2
+}
+
+main "$@"

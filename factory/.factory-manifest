@@ -1,0 +1,57 @@
+# =============================================================================
+# .factory-manifest - File ownership declaration
+#
+# Declares which files belong to the engine (replaced on update) vs the project
+# (created on install, never overwritten). Used by:
+#   - bin/install (copy_engine, copy_project to decide what to copy/skip)
+#   - meta/contribute (parse_engine_files to scope the upstream diff)
+#
+# Format rules:
+#   - Two sections: "# engine" and "# project"
+#   - The parser uses regex ^#.*"$section" to detect section headers
+#   - Any # line resets in_section=false, so NO comments between a section
+#     header and its entries (comments there would break the parser)
+#   - A blank line also ends a section
+#   - Entries are plain paths: files as-is, directories with trailing /
+#   - Runtime artifacts (worktree state, lock files, databases) are never listed
+#
+# Engine section: scripts, docs, templates, meta tools. Replaced by --update.
+# Project section: config, agents, quality rules, backlog. Never overwritten.
+# =============================================================================
+
+# engine
+.factory-manifest
+bin/resolve
+bin/gate
+bin/complete
+bin/run
+bin/intake
+bin/cancel
+bin/score
+bin/report
+bin/triage
+bin/track
+bin/prereq
+bin/validate
+bin/sanitize-spec
+bin/validate-behavior
+bin/db
+bin/merge-resolve
+bin/install
+bin/approve
+bin/onboard
+bin/test
+CLAUDE.md
+install-templates/commands/
+meta/test
+meta/contribute
+
+# project
+factory.json
+agents/
+quality/
+context/
+backlog/
+tracking/
+background-docs/
+meta/backlog/

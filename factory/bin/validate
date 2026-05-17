@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# validate - Run build, test, and lint checks from factory.json commands
+#
+# Executes each configured command (commands.build, commands.test, commands.lint)
+# and optionally runs shellcheck on factory scripts. Skips any command not
+# configured in factory.json rather than failing.
+#
+# Usage: ./validate [--build]
+#
+# Called by: gate (Layer 1 checks), can also be run standalone
+# Reads:    factory.json (commands.build, commands.test, commands.lint)
+# Exit:     0 = all checks pass, 1 = at least one check failed
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Run a named check command, reporting PASS/FAIL
+run_check() {
+  local name="$1" cmd="$2"
+  echo ":: [$name]" >&2
+  if eval "$cmd" >/dev/null 2>&1; then
+    echo "  PASS" >&2
+    return 0
+  else
+    echo "  FAIL" >&2
+    return 1
+  fi
+}
+
+# Run the project build command from factory.json
+check_build() {
+  local build_cmd
+  build_cmd=$(get_config "commands.build")
+  if [[ -z "$build_cmd" ]]; then
+    echo "  SKIP: no commands.build configured" >&2
+    return 0
+  fi
+  run_check "build" "$build_cmd"
+}
+
+# Run the project test command from factory.json
+check_test() {
+  local test_cmd
+  test_cmd=$(get_config "commands.test")
+  if [[ -z "$test_cmd" ]]; then
+    echo "  SKIP: no commands.test configured" >&2
+    return 0
+  fi
+  run_check "test" "$test_cmd"
+}
+
+# Run the project lint command from factory.json
+check_lint() {
+  local lint_cmd
+  lint_cmd=$(get_config "commands.lint")
+  if [[ -z "$lint_cmd" ]]; then
+    echo "  SKIP: no commands.lint configured" >&2
+    return 0
+  fi
+  run_check "lint" "$lint_cmd"
+}
+
+# Run shellcheck on a subset of factory scripts (requires shellcheck installed)
+check_shellcheck() {
+  if ! command -v shellcheck &>/dev/null; then
+    echo ":: [shellcheck]" >&2
+    echo "  SKIP: shellcheck not installed" >&2
+    return 0
+  fi
+
+  local failed=false
+  echo ":: [shellcheck]" >&2
+  for script in "$FACTORY_DIR"/db "$FACTORY_DIR"/track "$FACTORY_DIR"/validate; do
+    [[ -f "$script" ]] || continue
+    if head -1 "$script" | grep -q 'bash\|sh' 2>/dev/null; then
+      if shellcheck "$script" >/dev/null 2>&1; then
+        echo "  OK: $(basename "$script")" >&2
+      else
+        echo "  FAIL: $(basename "$script")" >&2
+        failed=true
+      fi
+    fi
+  done
+  [[ "$failed" == "false" ]]
+}
+
+# Read a dotted key from factory.json, returning empty string if missing
+get_config() {
+  local key="$1"
+  local config_file="$FACTORY_DIR/factory.json"
+  [[ -f "$config_file" ]] || { echo ""; return 0; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config_file'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '')
+" 2>/dev/null || echo ""
+}
+
+# --- main ---
+
+main() {
+  echo ":: Running validation checks" >&2
+
+  local failed=false
+
+  if ! check_build; then
+    failed=true
+  fi
+
+  if ! check_test; then
+    failed=true
+  fi
+
+  if ! check_lint; then
+    failed=true
+  fi
+
+  if ! check_shellcheck; then
+    failed=true
+  fi
+
+  echo "" >&2
+  if [[ "$failed" == "true" ]]; then
+    echo ":: VALIDATION FAILED" >&2
+    exit 1
+  else
+    echo ":: VALIDATION PASSED" >&2
+    exit 0
+  fi
+}
+
+main "$@"

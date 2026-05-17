@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# intake - Work item ingestion pipeline
+#
+# Turns a raw task description into validated, atomic backlog items through
+# a three-stage flow: clarify -> decompose -> review/approve.
+#
+# Pipeline stages:
+#   1. Clarifier: emits a prompt for the clarifier agent to refine a vague
+#      task description into a structured spec.
+#   2. Decomposer: takes a clarified spec (via --direct) and emits a prompt
+#      for the decomposer agent to split it into atomic backlog items.
+#   3. Review/Approve: validates decomposed items (atomicity, circular deps,
+#      file overlap) then copies approved items into backlog/.
+#
+# Relationships:
+#   - Uses agents/clarifier.md and agents/decomposer.md for prompt assembly
+#   - Reads context/atomicity.json for max-files-per-item validation
+#   - Writes to backlog/ on approve
+#   - Upstream: user invokes manually; downstream: resolve picks up new items
+#
+# Usage:
+#   ./intake "add dark mode support"        # Start with clarifier
+#   ./intake --direct clarified.md          # Skip to decomposer
+#   ./intake --review /tmp/items/           # Validate decomposed items
+#   ./intake --approve /tmp/items/          # Validate + copy to backlog
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+ATOMICITY_FILE="$FACTORY_DIR/context/atomicity.json"
+MAX_CLARIFIER_ROUNDS=3
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Extract a scalar YAML frontmatter field from a markdown file
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Extract a YAML list field (lines starting with "- ") from frontmatter
+get_list_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | sed -n "/^${field}:$/,/^[^ ]/p" | grep '^ *- ' | sed 's/^ *- *//' || true
+}
+
+# Generate the next sequential item ID (e.g., IMP-004) by scanning existing backlog
+next_item_id() {
+  local prefix="${1:-IMP}"
+  local max=0
+  for f in "$BACKLOG_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    local id
+    id=$(get_field "$f" "id")
+    local num
+    num=$(echo "$id" | grep -o '[0-9]*$' || echo 0)
+    [[ "$num" -gt "$max" ]] && max="$num"
+  done
+  local next=$(( max + 1 ))
+  printf '%s-%03d' "$prefix" "$next"
+}
+
+# Check that an item's file list doesn't exceed the atomicity limit
+validate_atomicity() {
+  local item_file="$1"
+  [[ -f "$ATOMICITY_FILE" ]] || return 0
+
+  local file_count
+  file_count=$(get_list_field "$item_file" "files" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+  local max_files
+  max_files=$(grep 'max_files_modified' "$ATOMICITY_FILE" | grep -o '[0-9]*' | head -1)
+  [[ -n "$max_files" ]] || max_files=5
+
+  if [[ "$file_count" -gt "$max_files" ]]; then
+    echo "  FAIL: $file_count files exceeds max $max_files" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Detect direct circular dependencies (A depends on B, B depends on A)
+validate_no_circular_deps() {
+  local items_dir="$1"
+  local visited=""
+  local failed=false
+
+  for f in "$items_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local id
+    id=$(get_field "$f" "id")
+    local deps
+    deps=$(get_list_field "$f" "depends-on")
+
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      local dep_file="$items_dir/${dep}.md"
+      [[ -f "$dep_file" ]] || continue
+      local dep_deps
+      dep_deps=$(get_list_field "$dep_file" "depends-on")
+      if echo "$dep_deps" | grep -qx "$id" 2>/dev/null; then
+        echo "  FAIL: Circular dependency: $id <-> $dep" >&2
+        failed=true
+      fi
+    done <<< "$deps"
+  done
+
+  [[ "$failed" == "false" ]]
+}
+
+# Warn if new items share files with existing open backlog items
+validate_no_duplicates() {
+  local items_dir="$1"
+  local failed=false
+
+  for f in "$items_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local id
+    id=$(get_field "$f" "id")
+    local files
+    files=$(get_list_field "$f" "files")
+
+    while IFS= read -r existing in "$BACKLOG_DIR"/*.md; do
+      [[ -f "$existing" ]] || continue
+      local existing_id
+      existing_id=$(get_field "$existing" "id")
+      [[ "$existing_id" != "$id" ]] || continue
+      local existing_status
+      existing_status=$(get_field "$existing" "status")
+      [[ "$existing_status" == "open" ]] || continue
+
+      local existing_files
+      existing_files=$(get_list_field "$existing" "files")
+      local overlap=0
+      while IFS= read -r ef; do
+        [[ -n "$ef" ]] || continue
+        if echo "$files" | grep -qx "$ef" 2>/dev/null; then
+          overlap=$(( overlap + 1 ))
+        fi
+      done <<< "$existing_files"
+
+      if [[ "$overlap" -gt 0 ]]; then
+        echo "  WARN: $id overlaps with existing $existing_id ($overlap shared files)" >&2
+      fi
+    done
+  done
+
+  [[ "$failed" == "false" ]]
+}
+
+# Emit the clarifier agent prompt between ---CLARIFIER-PROMPT-START/END--- markers
+run_clarifier() {
+  local description="$1"
+  local round=1
+
+  echo ":: Running clarifier (max $MAX_CLARIFIER_ROUNDS rounds)" >&2
+
+  local clarified="$description"
+  local agent_def="$FACTORY_DIR/agents/clarifier.md"
+  [[ -f "$agent_def" ]] || die "Clarifier agent not found"
+
+  echo ":: Clarifier context assembled. Agent prompt:" >&2
+  echo "---CLARIFIER-PROMPT-START---"
+  echo "# Agent Definition"
+  echo ""
+  cat "$agent_def"
+  echo ""
+  echo "---"
+  echo ""
+  echo "# Task Description"
+  echo ""
+  echo "$description"
+  echo ""
+  echo "---CLARIFIER-PROMPT-END---"
+
+  echo "" >&2
+  echo ":: Run the clarifier agent with the prompt above." >&2
+  echo ":: Feed the clarified output back with: $0 --direct <file>" >&2
+}
+
+# Emit the decomposer agent prompt with atomicity config and existing backlog context
+run_decomposer() {
+  local input_file="$1"
+
+  echo ":: Running decomposer" >&2
+
+  local agent_def="$FACTORY_DIR/agents/decomposer.md"
+  [[ -f "$agent_def" ]] || die "Decomposer agent not found"
+
+  local existing_items=""
+  if [[ -d "$BACKLOG_DIR" ]]; then
+    for f in "$BACKLOG_DIR"/*.md; do
+      [[ -f "$f" ]] || continue
+      local id title status
+      id=$(get_field "$f" "id")
+      title=$(get_field "$f" "title")
+      status=$(get_field "$f" "status")
+      existing_items+="- $id: $title ($status)"$'\n'
+    done
+  fi
+
+  echo "---DECOMPOSER-PROMPT-START---"
+  echo "# Agent Definition"
+  echo ""
+  cat "$agent_def"
+  echo ""
+  echo "---"
+  echo ""
+  echo "# Atomicity Config"
+  echo ""
+  cat "$ATOMICITY_FILE"
+  echo ""
+  echo "---"
+  echo ""
+  echo "# Clarified Task"
+  echo ""
+  cat "$input_file"
+  echo ""
+  echo "---"
+  echo ""
+  echo "# Existing Backlog"
+  echo ""
+  if [[ -n "$existing_items" ]]; then
+    printf '%s' "$existing_items"
+  else
+    echo "(empty)"
+  fi
+  echo ""
+  echo "---DECOMPOSER-PROMPT-END---"
+
+  echo "" >&2
+  echo ":: Run the decomposer agent with the prompt above." >&2
+  echo ":: Save output items to a temp directory, then: $0 --review <dir>" >&2
+}
+
+# Validate decomposed items: atomicity limits, circular deps, then print summary
+review_items() {
+  local items_dir="$1"
+  local failed=false
+
+  echo ":: Reviewing decomposed items" >&2
+
+  local count=0
+  for f in "$items_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    count=$(( count + 1 ))
+
+    local id
+    id=$(get_field "$f" "id")
+    local title
+    title=$(get_field "$f" "title")
+    echo "  [$count] $id: $title" >&2
+
+    if ! validate_atomicity "$f"; then
+      failed=true
+    fi
+  done
+
+  if [[ "$count" -eq 0 ]]; then
+    die "No items found in $items_dir"
+  fi
+
+  echo "" >&2
+
+  if ! validate_no_circular_deps "$items_dir"; then
+    failed=true
+  fi
+
+  if [[ "$failed" == "true" ]]; then
+    echo ":: VALIDATION FAILED - fix items and re-run review" >&2
+    return 1
+  fi
+
+  echo ":: Validation passed ($count items)" >&2
+  echo ":: To approve: $0 --approve $items_dir" >&2
+}
+
+# Copy validated items from temp directory into backlog/, skipping duplicates
+approve_items() {
+  local items_dir="$1"
+  mkdir -p "$BACKLOG_DIR"
+
+  local count=0
+  for f in "$items_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local id
+    id=$(get_field "$f" "id")
+    local dest="$BACKLOG_DIR/${id}.md"
+
+    if [[ -f "$dest" ]]; then
+      echo "  SKIP: $id already exists in backlog" >&2
+      continue
+    fi
+
+    cp "$f" "$dest"
+    count=$(( count + 1 ))
+    echo "  Added: $id" >&2
+  done
+
+  echo ":: $count items added to backlog" >&2
+}
+
+# --- main ---
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    --direct)
+      local input_file="${2:-}"
+      [[ -n "$input_file" ]] || die "Usage: $0 --direct <clarified_task_file>"
+      [[ -f "$input_file" ]] || die "File not found: $input_file"
+      run_decomposer "$input_file"
+      ;;
+    --review)
+      local items_dir="${2:-}"
+      [[ -n "$items_dir" ]] || die "Usage: $0 --review <items_directory>"
+      [[ -d "$items_dir" ]] || die "Directory not found: $items_dir"
+      review_items "$items_dir"
+      ;;
+    --approve)
+      local items_dir="${2:-}"
+      [[ -n "$items_dir" ]] || die "Usage: $0 --approve <items_directory>"
+      [[ -d "$items_dir" ]] || die "Directory not found: $items_dir"
+      review_items "$items_dir" || die "Fix validation errors before approving"
+      approve_items "$items_dir"
+      ;;
+    "")
+      die "Usage: $0 <description> or $0 --direct <file> or $0 --review <dir> or $0 --approve <dir>"
+      ;;
+    *)
+      if [[ -f "$cmd" ]]; then
+        run_clarifier "$(cat "$cmd")"
+      else
+        run_clarifier "$*"
+      fi
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# prereq - Stage prerequisite checker
+#
+# Verifies whether a feature is ready to begin a given pipeline stage. Checks:
+#   1. Stage is not in pipeline.skip_stages
+#   2. The previous stage (per pipeline.stages order) is marked complete
+#   3. Stage-specific file prerequisites exist (behavior.md, spec.md, needs.json)
+#
+# Exit codes:
+#   0 = READY    (all prerequisites met)
+#   1 = BLOCKED  (missing prerequisites, reasons printed to stderr)
+#   2 = SKIPPED  (stage is in skip_stages list)
+#
+# Usage: ./prereq <feature> <stage>
+#
+# Called by: resolve (checks prerequisites before dispatching agent work)
+# Reads:    factory.json (pipeline.stages, pipeline.skip_stages, pipeline.feature_path)
+#           factory/tracking/<feature>.track (via stage_done)
+#           Project files in the feature path (behavior.md, spec.md, needs.json)
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+TRACKING_DIR="$FACTORY_DIR/tracking"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Read a dotted key from factory.json, with optional default
+get_config() {
+  local key="$1" default="${2:-}"
+  local config="$FACTORY_DIR/factory.json"
+  [[ -f "$config" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+}
+
+# Check if a stage is already marked complete in the tracking file
+stage_done() {
+  local feature="$1" stage="$2"
+  local track_file="$TRACKING_DIR/${feature}.track"
+  [[ -f "$track_file" ]] && grep -q "^${stage}:" "$track_file" 2>/dev/null
+}
+
+# Check if a file exists relative to the project root
+file_exists_in_project() {
+  local path="$1"
+  [[ -f "$PROJECT_ROOT/$path" ]]
+}
+
+# Main prerequisite check: ordering, skip list, and stage-specific files
+check_stage_prereqs() {
+  local feature="$1" stage="$2"
+  local blocked=false
+  local reasons=""
+
+  # Check if stage is explicitly skipped in factory.json
+  local skip_stages
+  skip_stages=$(get_config "pipeline.skip_stages")
+  if echo "$skip_stages" | grep -qx "$stage" 2>/dev/null; then
+    echo ":: SKIPPED: $feature/$stage (in skip_stages)" >&2
+    return 2
+  fi
+
+  local feature_path
+  feature_path=$(get_config "pipeline.feature_path" "{feature}/")
+  feature_path="${feature_path//\{feature\}/$feature}"
+
+  local stages
+  stages=$(get_config "pipeline.stages")
+  [[ -n "$stages" ]] || stages="spec\ntest\nimpl"
+
+  # Walk the stage list to find the previous stage (ordering dependency)
+  local found=false
+  local prev_stage=""
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    if [[ "$s" == "$stage" ]]; then
+      found=true
+      break
+    fi
+    prev_stage="$s"
+  done <<< "$stages"
+
+  if [[ "$found" == "false" ]]; then
+    reasons+="  - unknown stage: $stage\n"
+    blocked=true
+  fi
+
+  if [[ -n "$prev_stage" ]]; then
+    if ! stage_done "$feature" "$prev_stage"; then
+      reasons+="  - $prev_stage stage not complete\n"
+      blocked=true
+    fi
+  fi
+
+  # Stage-specific file prerequisites
+  case "$stage" in
+    spec)
+      if ! file_exists_in_project "${feature_path}behavior.md"; then
+        reasons+="  - behavior.md not found\n"
+        blocked=true
+      fi
+      ;;
+    test)
+      if ! file_exists_in_project "${feature_path}spec.md"; then
+        reasons+="  - spec.md not found\n"
+        blocked=true
+      fi
+      ;;
+    views)
+      if ! file_exists_in_project "${feature_path}needs.json"; then
+        reasons+="  - needs.json not found\n"
+        blocked=true
+      fi
+      ;;
+  esac
+
+  if [[ "$blocked" == "true" ]]; then
+    echo ":: BLOCKED: $feature/$stage" >&2
+    printf "%b" "$reasons" >&2
+    return 1
+  else
+    echo ":: READY: $feature/$stage" >&2
+    return 0
+  fi
+}
+
+# --- main ---
+
+main() {
+  local feature="${1:-}"
+  local stage="${2:-}"
+  [[ -n "$feature" ]] || die "Usage: $0 <feature> <stage>"
+  [[ -n "$stage" ]] || die "Usage: $0 <feature> <stage>"
+
+  check_stage_prereqs "$feature" "$stage"
+}
+
+main "$@"

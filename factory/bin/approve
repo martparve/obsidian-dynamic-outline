@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# approve - Dependency approval flow for unknown imports and packages
+#
+# When the gate encounters imports or packages not in the allowlists, it exits
+# with code 3 ("needs_approval") and writes pending requests to
+# .runs/<item_id>.pending-approvals.json. This script handles the two-phase
+# approval flow:
+#
+# Phase 1 (prompt mode - default):
+#   Reads pending approvals, assembles context (friendliness setting, current
+#   allowlists, diff), and emits a prompt for the dependency-resolver agent.
+#   The agent writes its decisions to .runs/<item_id>.approval-decisions.json.
+#
+# Phase 2 (--apply mode):
+#   Reads the agent's decisions, adds approved imports/packages to the
+#   allowlists (in factory.json or legacy quality/ files), and writes denied
+#   items to .runs/<item_id>.approval-denials.txt. Exits 1 if any denied.
+#
+# Relationships:
+#   - Upstream: gate exits with code 3 and writes .pending-approvals.json
+#   - Uses agents/dependency-resolver.md (via emitted prompt)
+#   - Writes to factory.json (imports.allowed, packages.allowed) or legacy files
+#   - Downstream: re-run gate after applying decisions
+#
+# Usage:
+#   ./approve FM-012               # Emit resolver prompt
+#   ./approve --apply FM-012       # Apply resolver decisions to allowlists
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+RUNS_DIR="$FACTORY_DIR/.runs"
+IMPORTS_FILE="$FACTORY_DIR/quality/allowed-imports.json"
+PACKAGES_FILE="$FACTORY_DIR/quality/allowed-packages.json"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Determine the default branch (main, master, or from origin/HEAD)
+detect_default_branch() {
+  local branch
+  branch=$(git -C "$PROJECT_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -n "$branch" ]] && { echo "$branch"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify main >/dev/null 2>&1 && { echo "main"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify master >/dev/null 2>&1 && { echo "master"; return; }
+  echo "main"
+}
+
+DEFAULT_BRANCH=$(detect_default_branch)
+
+# Read a dotted key path from factory.json (e.g., "gate.dependency_friendliness")
+get_config() {
+  local key="$1" default="${2:-}"
+  local config="$FACTORY_DIR/factory.json"
+  [[ -f "$config" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+}
+
+# --- consolidated config readers (factory.json with legacy fallback) ---
+
+# Return "factory.json" or the legacy file path for imports allowlist
+get_imports_file_path() {
+  local from_config
+  from_config=$(get_config "imports.allowed" "")
+  if [[ -n "$from_config" ]] && [[ "$from_config" != "{}" ]]; then
+    echo "factory.json"
+    return
+  fi
+  [[ -f "$IMPORTS_FILE" ]] && echo "$IMPORTS_FILE" || echo "factory.json"
+}
+
+# Return "factory.json" or the legacy file path for packages allowlist
+get_packages_file_path() {
+  local from_config
+  from_config=$(python3 -c "
+import json
+config_path = '$FACTORY_DIR/factory.json'
+try:
+  d = json.load(open(config_path))
+  pkg = d.get('packages', {})
+  allowed = pkg.get('allowed', None)
+  review = pkg.get('review_required', None)
+  if allowed is not None or review is not None:
+    print('factory.json')
+except: pass
+" 2>/dev/null || true)
+  if [[ -n "$from_config" ]]; then
+    echo "factory.json"
+    return
+  fi
+  [[ -f "$PACKAGES_FILE" ]] && echo "$PACKAGES_FILE" || echo "factory.json"
+}
+
+# Extract a field from the item's runtime JSON (.runs/<item_id>.json)
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "No run context for $item_id"
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Infer language from project.file_extensions in factory.json
+detect_language() {
+  local extensions
+  extensions=$(get_config "project.file_extensions")
+  [[ -n "$extensions" ]] || { echo "unknown"; return; }
+  case "$extensions" in
+    *.swift*) echo "swift" ;;
+    *.py*)    echo "python" ;;
+    *.ts*)    echo "typescript" ;;
+    *.js*)    echo "javascript" ;;
+    *.go*)    echo "go" ;;
+    *.rs*)    echo "rust" ;;
+    *.sh*)    echo "bash" ;;
+    *)        echo "unknown" ;;
+  esac
+}
+
+# --- prompt mode ---
+
+# Build and emit the dependency-resolver agent prompt with all approval context
+emit_prompt() {
+  local item_id="$1"
+  local approvals_file="$RUNS_DIR/${item_id}.pending-approvals.json"
+
+  if [[ ! -f "$approvals_file" ]]; then
+    echo ":: No pending approvals for $item_id" >&2
+    exit 0
+  fi
+
+  local approvals_content
+  approvals_content=$(cat "$approvals_file")
+
+  # Check if empty (no imports or packages)
+  local has_items
+  has_items=$(python3 -c "
+import json, sys
+data = json.load(open('$approvals_file'))
+imports = data.get('imports', [])
+packages = data.get('packages', [])
+print('yes' if imports or packages else 'no')
+" 2>/dev/null || echo "no")
+
+  if [[ "$has_items" == "no" ]]; then
+    echo ":: No pending approvals for $item_id (empty lists)" >&2
+    exit 0
+  fi
+
+  local friendliness
+  friendliness=$(get_config "gate.dependency_friendliness" "moderate")
+
+  local language
+  language=$(detect_language)
+
+  local imports_content=""
+  local imports_src
+  imports_src=$(get_imports_file_path)
+  if [[ "$imports_src" == "factory.json" ]]; then
+    imports_content=$(get_config "imports.allowed" "{}")
+  elif [[ -f "$imports_src" ]]; then
+    imports_content=$(cat "$imports_src")
+  fi
+
+  local packages_content=""
+  local packages_src
+  packages_src=$(get_packages_file_path)
+  if [[ "$packages_src" == "factory.json" ]]; then
+    packages_content=$(python3 -c "
+import json
+d = json.load(open('$FACTORY_DIR/factory.json'))
+pkg = d.get('packages', {})
+result = {'allowed': pkg.get('allowed', []), 'review_required': pkg.get('review_required', [])}
+print(json.dumps(result, indent=2))
+" 2>/dev/null || echo "{}")
+  elif [[ -f "$packages_src" ]]; then
+    packages_content=$(cat "$packages_src")
+  fi
+
+  # Get diff context from worktree
+  local worktree diff_context=""
+  worktree=$(get_run_field "$item_id" "worktree" 2>/dev/null || echo "")
+  if [[ -n "$worktree" ]] && [[ -d "$worktree" ]]; then
+    diff_context=$(git -C "$worktree" diff "$DEFAULT_BRANCH" 2>/dev/null | head -500 || true)
+  fi
+
+  echo "---PROMPT-START---"
+  cat <<PROMPT
+# Dependency Approval Review
+
+## Friendliness: ${friendliness}
+## Language: ${language}
+
+## Pending Approvals
+
+${approvals_content}
+
+## Current Allowed Imports
+
+${imports_content}
+
+## Current Allowed Packages
+
+${packages_content}
+
+## Diff Context
+
+${diff_context}
+PROMPT
+  echo "---PROMPT-END---"
+}
+
+# --- apply mode ---
+
+# Read agent decisions, update allowlists, write denials file if any rejected
+apply_decisions() {
+  local item_id="$1"
+  local decisions_file="$RUNS_DIR/${item_id}.approval-decisions.json"
+  local denials_file="$RUNS_DIR/${item_id}.approval-denials.txt"
+
+  [[ -f "$decisions_file" ]] || die "No approval decisions found: $decisions_file"
+
+  local imports_src packages_src
+  imports_src=$(get_imports_file_path)
+  packages_src=$(get_packages_file_path)
+
+  local result
+  result=$(python3 -c "
+import json, sys, os
+
+decisions_path = '$decisions_file'
+imports_path = '$IMPORTS_FILE'
+packages_path = '$PACKAGES_FILE'
+factory_json_path = '$FACTORY_DIR/factory.json'
+denials_path = '$denials_file'
+imports_src = '$imports_src'
+packages_src = '$packages_src'
+
+with open(decisions_path) as f:
+    decisions = json.load(f)
+
+# Load current registries from appropriate source
+imports_data = {}
+if imports_src == 'factory.json' and os.path.exists(factory_json_path):
+    fj = json.load(open(factory_json_path))
+    imports_data = fj.get('imports', {}).get('allowed', {})
+elif os.path.exists(imports_path):
+    with open(imports_path) as f:
+        imports_data = json.load(f)
+
+packages_data = {}
+if packages_src == 'factory.json' and os.path.exists(factory_json_path):
+    fj = json.load(open(factory_json_path))
+    pkg = fj.get('packages', {})
+    packages_data = {'allowed': pkg.get('allowed', []), 'review_required': pkg.get('review_required', [])}
+elif os.path.exists(packages_path):
+    with open(packages_path) as f:
+        packages_data = json.load(f)
+
+has_denial = False
+denial_lines = []
+
+# Process import decisions
+for imp in decisions.get('imports', []):
+    name = imp.get('name', '')
+    layer = imp.get('layer', 'domain')
+    approved = imp.get('approved', False)
+
+    if not name:
+        continue
+
+    if approved:
+        if layer not in imports_data:
+            imports_data[layer] = {'allowed': [], 'banned': []}
+        allowed = imports_data[layer].get('allowed', [])
+        if name not in allowed:
+            allowed.append(name)
+            imports_data[layer]['allowed'] = allowed
+        print(f'APPROVED import: {name} -> {layer}', file=sys.stderr)
+    else:
+        reason = imp.get('reason', 'denied by reviewer')
+        denial_lines.append(f'import {name} ({layer}): {reason}')
+        has_denial = True
+        print(f'DENIED import: {name} ({layer}): {reason}', file=sys.stderr)
+
+# Process package decisions
+for pkg in decisions.get('packages', []):
+    name = pkg.get('name', '')
+    approved = pkg.get('approved', False)
+
+    if not name:
+        continue
+
+    if approved:
+        allowed = packages_data.get('allowed', [])
+        existing_names = [p['name'] if isinstance(p, dict) else p for p in allowed]
+        if name not in existing_names:
+            entry = {'name': name}
+            url = pkg.get('url', '')
+            if url:
+                entry['url'] = url
+            allowed.append(entry)
+            packages_data['allowed'] = allowed
+        print(f'APPROVED package: {name}', file=sys.stderr)
+    else:
+        reason = pkg.get('reason', 'denied by reviewer')
+        denial_lines.append(f'package {name}: {reason}')
+        has_denial = True
+        print(f'DENIED package: {name}: {reason}', file=sys.stderr)
+
+# Write updated registries back to the appropriate location
+if imports_src == 'factory.json' and os.path.exists(factory_json_path):
+    fj = json.load(open(factory_json_path))
+    fj.setdefault('imports', {})['allowed'] = imports_data
+    with open(factory_json_path, 'w') as f:
+        json.dump(fj, f, indent=2)
+        f.write('\n')
+else:
+    with open(imports_path, 'w') as f:
+        json.dump(imports_data, f, indent=2)
+        f.write('\n')
+
+if packages_src == 'factory.json' and os.path.exists(factory_json_path):
+    fj = json.load(open(factory_json_path))
+    fj.setdefault('packages', {})['allowed'] = packages_data.get('allowed', [])
+    fj['packages']['review_required'] = packages_data.get('review_required', [])
+    with open(factory_json_path, 'w') as f:
+        json.dump(fj, f, indent=2)
+        f.write('\n')
+else:
+    with open(packages_path, 'w') as f:
+        json.dump(packages_data, f, indent=2)
+        f.write('\n')
+
+# Write denials file
+if denial_lines:
+    with open(denials_path, 'w') as f:
+        f.write('\n'.join(denial_lines) + '\n')
+
+print('denied' if has_denial else 'approved')
+" 2>/dev/null)
+
+  if [[ "$result" == "denied" ]]; then
+    echo ":: Some dependencies were denied. See: $denials_file" >&2
+    exit 1
+  else
+    echo ":: All dependencies approved" >&2
+    exit 0
+  fi
+}
+
+# --- main ---
+
+main() {
+  local mode="prompt"
+  local item_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --apply)
+        mode="apply"
+        shift
+        ;;
+      -*)
+        die "Unknown option: $1"
+        ;;
+      *)
+        item_id="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$item_id" ]] || die "Usage: $0 [--apply] <item_id>"
+
+  case "$mode" in
+    prompt)
+      emit_prompt "$item_id"
+      ;;
+    apply)
+      apply_decisions "$item_id"
+      ;;
+  esac
+}
+
+main "$@"

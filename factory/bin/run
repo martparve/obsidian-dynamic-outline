@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# run - Autonomous dispatch loop: picks items, manages concurrency and timeouts
+#
+# Iterates up to max_iterations (default 50). Each iteration: checks telemetry
+# health (halts if 0 writes in 30 min), checks the circuit breaker (trips on 2
+# consecutive failures in the same rejection category), kills timed-out agents
+# (30 min default), then asks ./triage for ready items to fill available slots.
+# Dispatches items via ./resolve and reports next steps (gate, approve, complete).
+#
+# Circuit breaker: trips on 2 consecutive gate failures in the same category.
+# Reset with --resume. Telemetry health: halts if the DB exists but has 0 writes
+# in the last 30 minutes.
+#
+# Called by: operator to start unattended processing
+# Calls: ./resolve (dispatch), ./triage (item selection), ./db (health checks)
+#
+# Usage:
+#   ./run              # Start loop (default 50 iterations)
+#   ./run 10           # Limit to 10 iterations
+#   ./run --status     # Show in-progress items, circuit breaker, telemetry
+#   ./run --resume     # Reset circuit breaker
+#   ./run --cleanup    # Prune stale worktrees and orphaned run contexts
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+IN_PROGRESS="$FACTORY_DIR/.in-progress"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+TIERS_FILE="$FACTORY_DIR/context/tiers.json"
+CONCURRENCY_CAP=3
+AGENT_TIMEOUT=1800
+CIRCUIT_FILE="$FACTORY_DIR/.circuit-breaker"
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Read a field from .runs/<item_id>.json
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || return 0
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Return the number of items currently in progress
+count_in_progress() {
+  [[ -f "$IN_PROGRESS" ]] || { echo 0; return; }
+  grep -c '[^[:space:]]' "$IN_PROGRESS" 2>/dev/null || echo 0
+}
+
+# Dump raw .in-progress file contents (item_id, timestamp, pid per line)
+get_in_progress_entries() {
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  cat "$IN_PROGRESS"
+}
+
+# Halt if DB exists with records but 0 writes in the last 30 minutes (stalled pipeline)
+check_telemetry_health() {
+  [[ -f "$DB_PATH" ]] || return 0
+
+  local count
+  count=$("$FACTORY_DIR/db" query \
+    "SELECT COUNT(*) FROM gate_runs WHERE started_at > datetime('now', '-30 minutes');" 2>/dev/null || echo "0")
+
+  local total
+  total=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
+
+  if [[ "${total:-0}" -gt 0 ]] && [[ "${count:-0}" -eq 0 ]]; then
+    die "Telemetry health check failed: no writes in 30 minutes with $total total runs. Factory halt."
+  fi
+}
+
+# Return non-zero if circuit breaker file exists (tripped by consecutive same-category failures)
+check_circuit_breaker() {
+  [[ -f "$CIRCUIT_FILE" ]] || return 0
+
+  local category
+  category=$(head -1 "$CIRCUIT_FILE")
+  local timestamp
+  timestamp=$(tail -1 "$CIRCUIT_FILE")
+
+  echo ":: CIRCUIT BREAKER TRIPPED" >&2
+  echo ":: Category: $category" >&2
+  echo ":: Since: $timestamp" >&2
+  echo ":: Run: ./run --resume to reset" >&2
+  return 1
+}
+
+# Trip circuit breaker if the last 2 rejections share the same failure category
+update_circuit_breaker() {
+  local item_id="$1"
+  [[ -f "$DB_PATH" ]] || return 0
+
+  local last_two_categories
+  last_two_categories=$("$FACTORY_DIR/db" query \
+    "SELECT r.code FROM rejections r JOIN gate_runs g ON g.id=r.run_id WHERE g.outcome='fail' ORDER BY r.id DESC LIMIT 2;" 2>/dev/null || echo "")
+
+  [[ -n "$last_two_categories" ]] || return 0
+
+  # Compare the two most recent rejection codes - same code twice triggers breaker
+  local cat1 cat2
+  cat1=$(echo "$last_two_categories" | head -1)
+  cat2=$(echo "$last_two_categories" | tail -1)
+
+  if [[ -n "$cat1" ]] && [[ "$cat1" == "$cat2" ]]; then
+    local rej_category=""
+    if [[ -f "$TIERS_FILE" ]]; then
+      rej_category=$(python3 -c "
+import json
+data = json.load(open('$TIERS_FILE'))
+cats = data.get('rejection_categories', {})
+for cat_name, codes in cats.items():
+    if '$cat1' in codes:
+        print(cat_name)
+        break
+" 2>/dev/null || echo "$cat1")
+    fi
+
+    echo "${rej_category:-$cat1}" > "$CIRCUIT_FILE"
+    echo "$(date '+%Y-%m-%dT%H:%M:%S')" >> "$CIRCUIT_FILE"
+    echo ":: Circuit breaker tripped: 2 consecutive failures in category ${rej_category:-$cat1}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Kill agents that exceeded AGENT_TIMEOUT, mark their runs as crashed, clean up worktrees
+check_timeouts() {
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  local now
+  now=$(date +%s)
+
+  local timed_out=""
+  while IFS=$'\t' read -r item_id ts pid; do
+    [[ -n "$item_id" ]] || continue
+    local elapsed=$(( now - ts ))
+    if [[ "$elapsed" -gt "$AGENT_TIMEOUT" ]]; then
+      echo ":: Timeout: $item_id (${elapsed}s > ${AGENT_TIMEOUT}s)" >&2
+
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        echo ":: Killed PID $pid for $item_id" >&2
+      fi
+
+      "$FACTORY_DIR/db" query \
+        "UPDATE gate_runs SET outcome='crash', finished_at=datetime('now') WHERE item_id='$item_id' AND outcome='pass';" 2>/dev/null || true
+
+      local worktree
+      worktree=$(get_run_field "$item_id" "worktree")
+      if [[ -n "$worktree" ]] && [[ -d "$worktree" ]]; then
+        git -C "$PROJECT_ROOT" worktree remove --force "$worktree" 2>/dev/null || true
+      fi
+
+      timed_out+="$item_id"$'\n'
+    fi
+  done < "$IN_PROGRESS"
+
+  if [[ -n "$timed_out" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    while IFS=$'\t' read -r item_id ts pid; do
+      [[ -n "$item_id" ]] || continue
+      if ! echo "$timed_out" | grep -qx "$item_id" 2>/dev/null; then
+        printf '%s\t%s\t%s\n' "$item_id" "$ts" "$pid" >> "$tmp"
+      fi
+    done < "$IN_PROGRESS"
+    mv "$tmp" "$IN_PROGRESS"
+  fi
+}
+
+# Resolve a single item and print next-step instructions
+dispatch_item() {
+  local item_id="$1"
+  echo ":: Dispatching: $item_id" >&2
+
+  "$FACTORY_DIR/resolve" "$item_id" > /dev/null 2>&1 || {
+    echo ":: Failed to resolve $item_id" >&2
+    return 1
+  }
+
+  echo ":: Resolved $item_id. Agent prompt ready." >&2
+  echo ":: Run agent, then: ./gate $item_id" >&2
+  echo "::   If gate exits 0: ./complete $item_id" >&2
+  echo "::   If gate exits 3 (needs_approval):" >&2
+  echo "::     1. ./approve $item_id  (emit prompt, use with Agent tool)" >&2
+  echo "::     2. ./approve --apply $item_id  (apply decisions)" >&2
+  echo "::     3. ./gate $item_id  (re-gate)" >&2
+  echo "$item_id"
+}
+
+# Main dispatch loop: health checks, timeout handling, triage, dispatch, circuit breaker
+run_loop() {
+  local max_iterations="${1:-50}"
+  local iteration=0
+
+  echo ":: Factory autonomous loop starting" >&2
+  echo ":: Concurrency cap: $CONCURRENCY_CAP, Timeout: ${AGENT_TIMEOUT}s, Max iterations: $max_iterations" >&2
+
+  git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
+
+  while [[ "$iteration" -lt "$max_iterations" ]]; do
+    iteration=$(( iteration + 1 ))
+    echo "" >&2
+    echo ":: --- Iteration $iteration ---" >&2
+
+    check_telemetry_health
+    if ! check_circuit_breaker; then
+      echo ":: Circuit breaker active. Waiting for --resume." >&2
+      break
+    fi
+
+    check_timeouts
+
+    local ip_count
+    ip_count=$(count_in_progress)
+    local available=$(( CONCURRENCY_CAP - ip_count ))
+
+    if [[ "$available" -le 0 ]]; then
+      echo ":: All slots full ($ip_count/$CONCURRENCY_CAP). Waiting." >&2
+      sleep 30
+      continue
+    fi
+
+    local next_items
+    next_items=$("$FACTORY_DIR/triage" --next "$available" 2>/dev/null || true)
+
+    if [[ -z "$next_items" ]]; then
+      if [[ "$ip_count" -eq 0 ]]; then
+        echo ":: No ready items and no in-progress items. Done." >&2
+        break
+      fi
+      echo ":: No ready items. $ip_count items still in progress. Waiting." >&2
+      sleep 30
+      continue
+    fi
+
+    while IFS= read -r nid; do
+      [[ -n "$nid" ]] || continue
+      dispatch_item "$nid" || true
+
+      if update_circuit_breaker "$nid" 2>/dev/null; then
+        echo ":: Circuit breaker tripped. Stopping dispatch." >&2
+        break 2
+      fi
+    done <<< "$next_items"
+
+    sleep 5
+  done
+
+  echo ":: Autonomous loop ended after $iteration iterations" >&2
+}
+
+# Reset the circuit breaker so the dispatch loop can continue
+do_resume() {
+  if [[ -f "$CIRCUIT_FILE" ]]; then
+    local category
+    category=$(head -1 "$CIRCUIT_FILE")
+    rm -f "$CIRCUIT_FILE"
+    echo ":: Circuit breaker reset (was: $category)" >&2
+  else
+    echo ":: No circuit breaker to reset" >&2
+  fi
+}
+
+# Prune stale git worktrees and remove orphaned .runs/*.json not in .in-progress
+do_cleanup() {
+  echo ":: Cleaning up stale artifacts" >&2
+  git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
+
+  if [[ -d "$RUNS_DIR" ]]; then
+    for rf in "$RUNS_DIR"/*.json; do
+      [[ -f "$rf" ]] || continue
+      local rid
+      rid=$(basename "$rf" .json)
+      local in_prog=false
+      if [[ -f "$IN_PROGRESS" ]]; then
+        grep -q "^${rid}	" "$IN_PROGRESS" 2>/dev/null && in_prog=true
+      fi
+      if [[ "$in_prog" == "false" ]]; then
+        echo "  Removing stale run context: $rid" >&2
+        rm -f "$rf"
+      fi
+    done
+  fi
+
+  echo ":: Cleanup complete" >&2
+}
+
+# Show in-progress items with elapsed time and PID liveness, circuit breaker, telemetry
+do_status() {
+  local ip_count
+  ip_count=$(count_in_progress)
+  echo ":: Factory status" >&2
+  echo "  In progress: $ip_count/$CONCURRENCY_CAP" >&2
+
+  if [[ -f "$IN_PROGRESS" ]] && [[ -s "$IN_PROGRESS" ]]; then
+    local now
+    now=$(date +%s)
+    while IFS=$'\t' read -r item_id ts pid; do
+      [[ -n "$item_id" ]] || continue
+      local elapsed=$(( now - ts ))
+      local alive="dead"
+      kill -0 "$pid" 2>/dev/null && alive="alive"
+      echo "  $item_id: ${elapsed}s elapsed, PID $pid ($alive)" >&2
+    done < "$IN_PROGRESS"
+  fi
+
+  if [[ -f "$CIRCUIT_FILE" ]]; then
+    echo "  Circuit breaker: TRIPPED ($(head -1 "$CIRCUIT_FILE"))" >&2
+  else
+    echo "  Circuit breaker: OK" >&2
+  fi
+
+  if [[ -f "$DB_PATH" ]]; then
+    local recent
+    recent=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_runs WHERE started_at > datetime('now', '-30 minutes');" 2>/dev/null || echo "?")
+    echo "  Telemetry (last 30m): $recent runs" >&2
+  fi
+}
+
+# --- main ---
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    --resume)
+      do_resume
+      ;;
+    --cleanup)
+      do_cleanup
+      ;;
+    --status)
+      do_status
+      ;;
+    "")
+      run_loop
+      ;;
+    *)
+      if [[ "$cmd" =~ ^[0-9]+$ ]]; then
+        run_loop "$cmd"
+      else
+        die "Unknown option: $cmd. Valid: --resume, --cleanup, --status, or <max_iterations>"
+      fi
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Diagnostician Output",
+  "description": "Structured output from the diagnostician agent",
+  "type": "object",
+  "required": ["item_id", "diagnosis", "recommendation", "signals"],
+  "additionalProperties": false,
+  "properties": {
+    "item_id": {
+      "type": "string",
+      "pattern": "^[A-Z]+-[0-9]+$"
+    },
+    "diagnosis": {
+      "type": "object",
+      "required": ["root_cause_category", "root_cause", "affected_files", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "root_cause_category": {
+          "type": "string",
+          "enum": [
+            "build_error",
+            "test_regression",
+            "type_mismatch",
+            "missing_conformance",
+            "wrong_async_boundary",
+            "spec_ambiguity",
+            "dependency_missing",
+            "incorrect_logic",
+            "race_condition",
+            "state_corruption",
+            "missing_error_handling"
+          ]
+        },
+        "root_cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "affected_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": ["action", "rationale", "context_for_next_agent"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["retry", "retry_with_module", "escalate", "fix_spec", "fix_tests"]
+        },
+        "module": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context_for_next_agent": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "required": ["pre_existing_failures", "touched_files_only"],
+      "additionalProperties": false,
+      "properties": {
+        "pre_existing_failures": {
+          "type": "boolean"
+        },
+        "touched_files_only": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

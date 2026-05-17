@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# validate-behavior - Validate behavior.md spec structure
+#
+# Runs 7 checks against a behavior.md file to ensure it conforms to the
+# factory's spec format before agents consume it:
+#   1. Required H2 sections exist (Purpose, Data Model, Behaviors, etc.)
+#   2. Required behavior categories exist as H3 headings
+#   3. Behavior numbers are sequential and unique
+#   4. No platform-specific terms from the blocklist appear
+#   5. Cross-feature references are valid (placeholder - not yet implemented)
+#   6. Source behaviors all have [carry], [drop], or [fix] tags
+#   7. Line count does not exceed the configured maximum
+#
+# Usage: ./validate-behavior <behavior.md>
+#
+# Called by: resolve (validates spec before agent dispatch)
+# Reads:    quality/platform-terms.json (banned term blocklist)
+#           context/atomicity.json (max_behavior_md_lines setting)
+# Exit:     0 = valid, 1 = validation failed
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+PLATFORM_TERMS="$FACTORY_DIR/quality/platform-terms.json"
+ATOMICITY_CONFIG="$FACTORY_DIR/context/atomicity.json"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Verify all required H2 sections are present
+check_sections() {
+  local file="$1"
+  local failed=false
+  local required_sections=("Purpose" "Data Model" "Behaviors" "Cross-Feature Dependencies" "Source Behaviors")
+
+  for section in "${required_sections[@]}"; do
+    if ! grep -q "^## ${section}" "$file"; then
+      echo "  FAIL: Missing section: ## $section" >&2
+      failed=true
+    fi
+  done
+
+  [[ "$failed" == "false" ]]
+}
+
+# Verify all required H3 behavior category headings are present
+check_behavior_categories() {
+  local file="$1"
+  local failed=false
+  local categories=("Lifecycle" "Data" "Interaction" "Display" "Navigation" "Error")
+
+  for cat in "${categories[@]}"; do
+    if ! grep -q "### ${cat}" "$file"; then
+      echo "  FAIL: Missing behavior category: ### $cat" >&2
+      failed=true
+    fi
+  done
+
+  [[ "$failed" == "false" ]]
+}
+
+# Verify behavior numbers are sequential and have no duplicates
+check_numbering() {
+  local file="$1"
+  local numbers
+  numbers=$(grep -oE '^\s*[0-9]+\.' "$file" | sed 's/[^0-9]//g' | sort -n)
+
+  if [[ -z "$numbers" ]]; then
+    echo "  FAIL: No numbered behaviors found" >&2
+    return 1
+  fi
+
+  local prev=0
+  local failed=false
+  while IFS= read -r num; do
+    [[ -n "$num" ]] || continue
+    if [[ "$num" -le "$prev" ]]; then
+      echo "  FAIL: Non-sequential numbering at $num (previous: $prev)" >&2
+      failed=true
+    fi
+    prev="$num"
+  done <<< "$numbers"
+
+  local unique_count
+  unique_count=$(echo "$numbers" | sort -u | wc -l | tr -d ' ')
+  local total_count
+  total_count=$(echo "$numbers" | wc -l | tr -d ' ')
+
+  if [[ "$unique_count" -ne "$total_count" ]]; then
+    echo "  FAIL: Duplicate behavior numbers found" >&2
+    failed=true
+  fi
+
+  [[ "$failed" == "false" ]]
+}
+
+# Scan for banned platform-specific terms from quality/platform-terms.json
+check_platform_terms() {
+  local file="$1"
+  if [[ ! -f "$PLATFORM_TERMS" ]]; then
+    echo "  SKIP: platform-terms.json not found" >&2
+    return 0
+  fi
+
+  local terms
+  terms=$(grep -o '"[^"]*"' "$PLATFORM_TERMS" | tr -d '"' | grep -v 'blocklist')
+
+  local failed=false
+  while IFS= read -r term; do
+    [[ -n "$term" ]] || continue
+    if grep -qw "$term" "$file"; then
+      echo "  FAIL: Platform-specific term found: $term" >&2
+      failed=true
+    fi
+  done <<< "$terms"
+
+  [[ "$failed" == "false" ]]
+}
+
+# Ensure every numbered item under "Source Behaviors" has a [carry], [drop], or [fix] tag
+check_source_behaviors_tagged() {
+  local file="$1"
+  local in_source=false
+  local failed=false
+
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "^## Source Behaviors"; then
+      in_source=true
+      continue
+    fi
+    if [[ "$in_source" == "true" ]] && echo "$line" | grep -q "^##"; then
+      break
+    fi
+    if [[ "$in_source" == "true" ]] && echo "$line" | grep -qE '^\s*[0-9]+\.'; then
+      if ! echo "$line" | grep -qE '\[(carry|drop|fix)\]'; then
+        echo "  FAIL: Untagged source behavior: $line" >&2
+        failed=true
+      fi
+    fi
+  done < "$file"
+
+  [[ "$failed" == "false" ]]
+}
+
+# Check that the spec does not exceed max line count (default 300, configurable)
+check_line_count() {
+  local file="$1"
+  local max_lines=300
+
+  if [[ -f "$ATOMICITY_CONFIG" ]]; then
+    local config_max
+    config_max=$(grep 'max_behavior_md_lines' "$ATOMICITY_CONFIG" | grep -o '[0-9]*')
+    [[ -n "$config_max" ]] && max_lines="$config_max"
+  fi
+
+  local count
+  count=$(wc -l < "$file" | tr -d ' ')
+
+  if [[ "$count" -gt "$max_lines" ]]; then
+    echo "  FAIL: Line count $count exceeds max $max_lines" >&2
+    return 1
+  fi
+  return 0
+}
+
+# --- main ---
+
+main() {
+  local behavior_file="${1:-}"
+  [[ -n "$behavior_file" ]] || die "Usage: $0 <behavior.md>"
+  [[ -f "$behavior_file" ]] || die "File not found: $behavior_file"
+
+  echo ":: Validating behavior file: $behavior_file" >&2
+
+  local failed=false
+
+  echo ":: [1/7] Section order" >&2
+  if ! check_sections "$behavior_file"; then failed=true; fi
+
+  echo ":: [2/7] Behavior categories" >&2
+  if ! check_behavior_categories "$behavior_file"; then failed=true; fi
+
+  echo ":: [3/7] Sequential numbering" >&2
+  if ! check_numbering "$behavior_file"; then failed=true; fi
+
+  echo ":: [4/7] Platform-specific terms" >&2
+  if ! check_platform_terms "$behavior_file"; then failed=true; fi
+
+  echo ":: [5/7] Cross-feature references" >&2
+  echo "  SKIP: requires feature list (not yet configured)" >&2
+
+  echo ":: [6/7] Source behavior tags" >&2
+  if ! check_source_behaviors_tagged "$behavior_file"; then failed=true; fi
+
+  echo ":: [7/7] Line count bounds" >&2
+  if ! check_line_count "$behavior_file"; then failed=true; fi
+
+  echo "" >&2
+  if [[ "$failed" == "true" ]]; then
+    echo ":: VALIDATION FAILED" >&2
+    exit 1
+  else
+    echo ":: VALIDATION PASSED" >&2
+    exit 0
+  fi
+}
+
+main "$@"

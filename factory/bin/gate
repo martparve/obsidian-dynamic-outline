@@ -1,0 +1,1552 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# gate - Three-layer quality gate for the Code Factory pipeline
+# =============================================================================
+#
+# PURPOSE
+#   Validates agent-produced code in a worktree before it can be merged to main.
+#   Sits between `resolve` (which sets up the worktree and emits the agent prompt)
+#   and `complete` (which merges the result). No code reaches main without passing
+#   the gate.
+#
+# THREE-LAYER ARCHITECTURE
+#   Layer 1 (all items): Deterministic, fast checks.
+#     - Bounded-impact diff: changed files must match the item's declared file list
+#     - New file cap: limits how many files a single item can add
+#     - Import allowlist: checks imports against per-layer allowed/banned lists
+#     - Package allowlist: checks new dependencies against approved packages
+#     - Build, test, lint: runs configured commands from factory.json
+#     - Test coverage: new source files must have corresponding test files
+#
+#   Layer 2 (medium + heavy items): Structural lint - pattern-based code checks.
+#     - Which checks run is configured in factory.json gate.layer2_checks
+#     - Examples: @MainActor enforcement, FetchDescriptor guard, ATS bypass,
+#       secrets scan, shared-capability duplication
+#
+#   Layer 3 (configurable, default heavy only): Evaluator agent scoring.
+#     - Invokes the `score` script which runs an LLM evaluator
+#     - Controlled by gate.evaluator_weights in factory.json
+#     - Can return pass/fail/review (review = human must decide)
+#
+# GATE WEIGHT AND ESCALATION
+#   Gate weight (light/medium/heavy) is assigned by `resolve` based on item
+#   complexity. The gate can escalate mid-run: if the diff exceeds configured
+#   thresholds (default >3 files or >200 lines), a light/medium item escalates
+#   to heavy, triggering all three layers.
+#
+# EXIT CODES
+#   0 - pass (or review, which still exits 0 but writes "review" to stdout)
+#   1 - fail (deterministic check, structural lint, or evaluator failure)
+#   3 - needs_approval (unknown imports or packages not in allowlist)
+#
+# KEY CONFIGURATION (factory.json)
+#   commands.build / commands.test / commands.lint - shell commands for L1
+#   imports.allowed / imports.pattern - import allowlist and extraction regex
+#   packages.allowed / packages.manifest - package allowlist and manifest file
+#   gate.layer2_checks - list of L2 check names to run (e.g. ["mainactor","secrets"])
+#   gate.evaluator_weights - which weights run L3 (default: ["heavy"])
+#   gate.tiers - escalation thresholds and new file cap overrides
+#   testing.source_dirs / testing.test_dirs / testing.test_prefix/suffix - TDD config
+#
+# RUNTIME FILES
+#   Reads:  .runs/<item_id>.json (worktree path, gate weight, run_id)
+#   Writes: .runs/<item_id>.pending-approvals.json (on exit 3)
+#           .runs/<item_id>.evaluator-feedback.txt (on L3 fail/review)
+#   Updates: .runs/<item_id>.json with gate_result field
+#   Telemetry: gate_executions, gate_checks, rejections, diff_stats via `db` script
+#
+# USAGE
+#   ./gate <item_id>
+# =============================================================================
+
+# --- path setup ---
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+
+# Legacy file paths - used as fallback when factory.json doesn't have the data.
+# Projects that haven't migrated to factory.json still use these standalone files.
+TIERS_FILE="$FACTORY_DIR/context/tiers.json"
+IMPORTS_FILE="$FACTORY_DIR/quality/allowed-imports.json"
+PACKAGES_FILE="$FACTORY_DIR/quality/allowed-packages.json"
+SHARED_CAP="$FACTORY_DIR/quality/shared-capabilities.md"
+JUSTIFICATION_CRITERIA="$FACTORY_DIR/quality/justification-criteria.md"
+REGISTRY_LOCK="$FACTORY_DIR/.registry.lock"
+
+# --- utility functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Determine the default branch name (main or master) by checking:
+# 1. The remote HEAD symbolic ref (most reliable)
+# 2. Whether a local 'main' branch exists
+# 3. Whether a local 'master' branch exists
+# 4. Falls back to 'main'
+detect_default_branch() {
+  local branch
+  branch=$(git -C "$PROJECT_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -n "$branch" ]] && { echo "$branch"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify main >/dev/null 2>&1 && { echo "main"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify master >/dev/null 2>&1 && { echo "master"; return; }
+  echo "main"
+}
+
+DEFAULT_BRANCH=$(detect_default_branch)
+
+# Read a dot-delimited key from factory.json (e.g. "gate.layer2_checks").
+# Walks the JSON tree one key at a time. Returns:
+#   - list values as newline-separated strings (one item per line)
+#   - dict values as JSON
+#   - scalar values as-is
+#   - $default if the key is missing or factory.json doesn't exist
+get_config() {
+  local key="$1" default="${2:-}"
+  local config="$FACTORY_DIR/factory.json"
+  [[ -f "$config" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+}
+
+# --- consolidated config readers (factory.json with legacy fallback) ---
+# These functions read configuration from factory.json first. If the key is
+# missing or empty, they fall back to the legacy standalone JSON files
+# (quality/allowed-imports.json, quality/allowed-packages.json, context/tiers.json).
+# This lets projects migrate to factory.json gradually.
+
+# Returns the import allowlist as a JSON object with per-layer allowed/banned lists.
+get_imports_data() {
+  local from_config
+  from_config=$(get_config "imports.allowed" "")
+  if [[ -n "$from_config" ]] && [[ "$from_config" != "{}" ]]; then
+    local has_entries
+    has_entries=$(echo "$from_config" | python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+has_entries = any(
+    layer_data.get('allowed', [])
+    for layer_data in data.values()
+    if isinstance(layer_data, dict)
+)
+print('true' if has_entries else 'false')
+" 2>/dev/null || echo "false")
+    if [[ "$has_entries" == "true" ]]; then
+      echo "$from_config"
+      return
+    fi
+  fi
+  local legacy="$IMPORTS_FILE"
+  [[ -f "$legacy" ]] && cat "$legacy" || echo "{}"
+}
+
+# Returns allowed/review_required package lists as JSON.
+# Uses a direct python3 call instead of get_config because the packages
+# structure has two sibling keys (allowed, review_required) that need
+# to be returned together as a single JSON object.
+get_packages_data() {
+  local from_config
+  from_config=$(python3 -c "
+import json
+config_path = '$FACTORY_DIR/factory.json'
+try:
+  d = json.load(open(config_path))
+  pkg = d.get('packages', {})
+  allowed = pkg.get('allowed', None)
+  review = pkg.get('review_required', None)
+  if allowed is not None or review is not None:
+    result = {}
+    if allowed is not None: result['allowed'] = allowed
+    if review is not None: result['review_required'] = review
+    print(json.dumps(result))
+except: pass
+" 2>/dev/null || true)
+  if [[ -n "$from_config" ]]; then
+    echo "$from_config"
+    return
+  fi
+  local legacy="$PACKAGES_FILE"
+  [[ -f "$legacy" ]] && cat "$legacy" || echo '{"allowed":[],"review_required":[]}'
+}
+
+# Returns gate tier configuration (escalation thresholds, new file cap) as JSON.
+get_tiers_data() {
+  local from_config
+  from_config=$(get_config "gate.tiers" "")
+  if [[ -n "$from_config" ]] && [[ "$from_config" != "{}" ]]; then
+    echo "$from_config"
+    return
+  fi
+  local legacy="$TIERS_FILE"
+  [[ -f "$legacy" ]] && cat "$legacy" || echo "{}"
+}
+
+# Lists source files changed vs the default branch, filtered to project.file_extensions.
+# Converts the extension list (e.g. ".swift\n.py") into a grep alternation pattern
+# (e.g. "\.swift|\.py") so only relevant source files are returned.
+get_changed_source_files() {
+  local worktree="$1"
+  local extensions
+  extensions=$(get_config "project.file_extensions")
+  [[ -n "$extensions" ]] || return 0
+  local ext_pattern
+  # sed escapes the leading dot, tr joins with pipe, final sed trims trailing pipe
+  ext_pattern=$(echo "$extensions" | sed 's/^\./\\\./' | tr '\n' '|' | sed 's/|$//')
+  git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only 2>/dev/null | grep -E "(${ext_pattern})$" || true
+}
+
+# Extracts import module names from a source file using the regex defined in
+# imports.pattern (factory.json). The regex must have capture group 1 for the
+# module name. For example, Swift uses "^import\s+(\w+)" and Python uses
+# "^(?:import|from)\s+(\w+)".
+extract_imports() {
+  local file="$1"
+  local pattern
+  pattern=$(get_config "imports.pattern")
+  [[ -n "$pattern" ]] || return 0
+  python3 -c "
+import re
+pattern = r'$pattern'
+with open('$file') as f:
+  for line in f:
+    m = re.match(pattern, line.strip())
+    if m and m.group(1):
+      print(m.group(1))
+" 2>/dev/null || true
+}
+
+# Extracts a single field value from the run context JSON using grep+sed.
+# This avoids a python3 invocation for simple lookups. The sed pattern handles
+# both quoted string values ("field": "value") and unquoted numbers ("field": 42)
+# by matching everything between the colon and the next comma/brace/quote.
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "No run context for $item_id"
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Returns the list of files declared in the run context (one per line).
+# Used by diff checks to verify the agent only touched expected files.
+get_declared_files() {
+  local item_id="$1"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || return 0
+  python3 -c "
+import json
+data = json.load(open('$runs_file'))
+files = data.get('files', [])
+for f in files:
+    print(f)
+" 2>/dev/null || true
+}
+
+# --- telemetry recording ---
+# These functions write structured telemetry to the SQLite database via the `db`
+# script. All are fire-and-forget (errors suppressed) so telemetry failures
+# never block the gate itself.
+
+# Records a gate rejection with tier (deterministic/lint), error code, detail,
+# and optional file path + line number for precise location.
+record_rejection() {
+  local item_id="$1" tier="$2" code="$3" detail="$4"
+  local file_path="${5:-}" line_no="${6:-}"
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id" 2>/dev/null || echo "")
+  [[ -n "$run_id" ]] || return 0
+  "$FACTORY_DIR/db" insert-rejection "$run_id" "$tier" "$code" "" "$detail" "$file_path" "$line_no" 2>/dev/null || true
+}
+
+# Records the outcome of an individual check (pass/fail/skip/needs_approval)
+# with the layer number (1/2/3) and check name for the telemetry dashboard.
+record_check() {
+  local item_id="$1" layer="$2" check_name="$3" outcome="$4"
+  local detail="${5:-}"
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id" 2>/dev/null || echo "")
+  [[ -n "$run_id" ]] || return 0
+  "$FACTORY_DIR/db" insert-check "$run_id" "$layer" "$check_name" "$outcome" "$detail" 2>/dev/null || true
+}
+
+# Finalizes the gate execution telemetry record. Called once at the end of
+# every gate run (pass or fail). Computes duration, queries check counts from
+# the database, and updates the gate_executions row with the final outcome.
+# The escalated_weight parameter records whether the gate weight was bumped
+# mid-run (empty string means no escalation occurred).
+finalize_gate_exec() {
+  local exec_id="$1" outcome="$2" failed_layer="${3:-}"
+  local gate_start_ms="$4" escalated_weight="${5:-}"
+  [[ -n "$exec_id" ]] || return 0
+
+  # Calculate wall-clock duration in milliseconds
+  local gate_end_ms duration_ms
+  gate_end_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
+  duration_ms=$(( gate_end_ms - gate_start_ms ))
+  [[ "$duration_ms" -gt 0 ]] || duration_ms=0
+
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id" 2>/dev/null || echo "")
+
+  # Aggregate check outcomes for the summary row
+  local checks_total checks_passed checks_failed checks_skipped
+  checks_total=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_checks WHERE run_id=${run_id:-0};" 2>/dev/null || echo 0)
+  checks_passed=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_checks WHERE run_id=${run_id:-0} AND outcome='pass';" 2>/dev/null || echo 0)
+  checks_failed=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_checks WHERE run_id=${run_id:-0} AND outcome='fail';" 2>/dev/null || echo 0)
+  checks_skipped=$("$FACTORY_DIR/db" query "SELECT COUNT(*) FROM gate_checks WHERE run_id=${run_id:-0} AND outcome='skip';" 2>/dev/null || echo 0)
+
+  local fl="${failed_layer:-0}"
+
+  "$FACTORY_DIR/db" update-gate-exec "$exec_id" "$outcome" \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$duration_ms" "$fl" \
+    "$checks_total" "$checks_passed" "$checks_failed" "$checks_skipped" \
+    "$escalated_weight" 2>/dev/null || true
+}
+
+# Records per-file diff statistics (lines added, lines removed, new/deleted flags)
+# to the telemetry database. Uses git --numstat for line counts and --diff-filter
+# for new/deleted classification. Binary files report "-" for line counts, which
+# we normalize to 0.
+record_diff_stats() {
+  local exec_id="$1" item_id="$2" worktree="$3"
+  [[ -n "$exec_id" ]] || return 0
+
+  # Pre-fetch new and deleted file lists so we can tag each file in the loop
+  local new_files deleted_files
+  new_files=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only --diff-filter=A 2>/dev/null || true)
+  deleted_files=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only --diff-filter=D 2>/dev/null || true)
+
+  # --numstat outputs: <added>\t<removed>\t<filepath> per file
+  git -C "$worktree" diff "$DEFAULT_BRANCH" --numstat 2>/dev/null | while IFS=$'\t' read -r added removed filepath; do
+    [[ -n "$filepath" ]] || continue
+    # Binary files show "-" instead of numbers
+    [[ "$added" == "-" ]] && added=0
+    [[ "$removed" == "-" ]] && removed=0
+    local is_new=0 is_deleted=0
+    echo "$new_files" | grep -qx "$filepath" 2>/dev/null && is_new=1
+    echo "$deleted_files" | grep -qx "$filepath" 2>/dev/null && is_deleted=1
+    "$FACTORY_DIR/db" insert-diff-stat "$exec_id" "$item_id" "$filepath" "$added" "$removed" "$is_new" "$is_deleted" 2>/dev/null || true
+  done
+}
+
+# --- gate weight escalation ---
+# Checks whether the actual diff size exceeds the thresholds for the assigned
+# gate weight. If a light or medium item has more than file_threshold changed
+# files (default 3) or more than line_threshold insertions (default 200), the
+# gate weight escalates to "heavy", which triggers Layer 2 and Layer 3 checks
+# that would otherwise be skipped. Heavy items can't escalate further.
+#
+# Thresholds are configurable via gate.tiers.gate_escalation in factory.json.
+# The python3 calls parse the tiers JSON from stdin to extract threshold values.
+check_gate_escalation() {
+  local item_id="$1" gate_weight="$2" worktree="$3"
+  # Already at maximum weight - nothing to escalate
+  [[ "$gate_weight" == "heavy" ]] && return 0
+
+  local file_threshold=3 line_threshold=200
+  local tiers_json
+  tiers_json=$(get_tiers_data)
+  # Override defaults from tiers config if present
+  if [[ -n "$tiers_json" ]] && [[ "$tiers_json" != "{}" ]]; then
+    local ft
+    ft=$(echo "$tiers_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('gate_escalation',{}).get('file_count_threshold',''))" 2>/dev/null)
+    [[ -n "$ft" ]] && file_threshold="$ft"
+    local lt
+    lt=$(echo "$tiers_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('gate_escalation',{}).get('line_count_threshold',''))" 2>/dev/null)
+    [[ -n "$lt" ]] && line_threshold="$lt"
+  fi
+
+  local changed_files
+  changed_files=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only 2>/dev/null | wc -l | tr -d ' ')
+  # Extract insertion count from the summary line of git diff --stat
+  # (e.g. "5 files changed, 120 insertions(+), 30 deletions(-)")
+  local changed_lines
+  changed_lines=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --stat 2>/dev/null | tail -1 | grep -o '[0-9]* insertion' | grep -o '[0-9]*' || echo 0)
+
+  if [[ "$changed_files" -gt "$file_threshold" ]] || [[ "${changed_lines:-0}" -gt "$line_threshold" ]]; then
+    echo ":: Gate escalation: $changed_files files, ${changed_lines:-0} lines -> heavy" >&2
+    echo "heavy"
+    return
+  fi
+  echo "$gate_weight"
+}
+
+# --- Layer 1: Deterministic checks ---
+# These checks run for ALL items regardless of gate weight.
+# They are fast, deterministic, and catch structural violations.
+
+# Bounded-impact diff check: verifies the agent only changed files declared
+# in the backlog item's YAML frontmatter `files:` list. This prevents scope
+# creep where an agent modifies unrelated files.
+#
+# Returns: "EMPTY" if no changes, "OK" if all changes are within scope (or no
+# files declared), "FAIL" if undeclared files were changed.
+#
+# The sed pipeline extracts the files list from YAML frontmatter:
+#   1. Select content between --- markers (frontmatter)
+#   2. Select the files: block until the next non-indented key
+#   3. Match list items (lines starting with "  - ")
+#   4. Strip the "  - " prefix
+layer1_diff_check() {
+  local item_id="$1" worktree="$2"
+  local changed
+  changed=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only 2>/dev/null)
+
+  if [[ -z "$changed" ]]; then
+    echo ":: Empty diff - no changes" >&2
+    echo "EMPTY"
+    return
+  fi
+
+  local backlog_dir="$FACTORY_DIR/backlog"
+  local item_file="$backlog_dir/${item_id}.md"
+  local declared=""
+  if [[ -f "$item_file" ]]; then
+    declared=$(sed -n '/^---$/,/^---$/p' "$item_file" | sed -n '/^files:$/,/^[^ ]/p' | grep '^ *- ' | sed 's/^ *- *//')
+  fi
+
+  # If no files declared in the backlog item, skip the check
+  if [[ -z "$declared" ]]; then
+    echo "OK"
+    return
+  fi
+
+  # Check each changed file against the declared list. Prefix matching allows
+  # declaring a directory (e.g. "Features/Auth/") to cover all files under it.
+  local failed=false
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local is_declared=false
+    while IFS= read -r df; do
+      [[ -n "$df" ]] || continue
+      if [[ "$f" == "$df" ]] || echo "$f" | grep -q "^${df}"; then
+        is_declared=true
+        break
+      fi
+    done <<< "$declared"
+
+    # Self-hosted sync allowance: factory/bin/X allowed when bin/X is declared,
+    # factory/meta/X allowed when meta/X is declared
+    if [[ "$is_declared" == "false" ]]; then
+      case "$f" in
+        factory/bin/*|factory/meta/*)
+          local root_equiv="${f#factory/}"
+          if echo "$declared" | grep -qx "$root_equiv" 2>/dev/null; then
+            is_declared=true
+          fi
+          ;;
+      esac
+    fi
+
+    if [[ "$is_declared" == "false" ]]; then
+      echo "  FAIL: Undeclared file change: $f" >&2
+      record_rejection "$item_id" "deterministic" "bounded_impact" "Change to undeclared file: $f" "$f" ""
+      failed=true
+    fi
+  done <<< "$changed"
+
+  [[ "$failed" == "false" ]] && echo "OK" || echo "FAIL"
+}
+
+# New file cap: limits the number of newly added files per item.
+# Default cap is 5, configurable via gate.tiers.max_new_files.
+# Prevents agents from creating excessive file structures in a single item.
+layer1_new_file_cap() {
+  local item_id="$1" worktree="$2"
+  local new_files
+  new_files=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only --diff-filter=A 2>/dev/null)
+  [[ -n "$new_files" ]] || return 0
+
+  local count
+  count=$(echo "$new_files" | wc -l | tr -d ' ')
+  local max=5
+
+  local tiers_json
+  tiers_json=$(get_tiers_data)
+  if [[ -n "$tiers_json" ]] && [[ "$tiers_json" != "{}" ]]; then
+    local cap
+    cap=$(echo "$tiers_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('max_new_files',''))" 2>/dev/null)
+    [[ -n "$cap" ]] && max="$cap"
+  fi
+
+  if [[ "$count" -gt "$max" ]]; then
+    echo "  FAIL: $count new files exceeds cap of $max" >&2
+    record_rejection "$item_id" "deterministic" "bounded_impact" "$count new files exceeds cap $max"
+    return 1
+  fi
+  return 0
+}
+
+# Import allowlist check: validates every import in changed source files against
+# the per-layer allowlist. The allowlist can have separate rules for "domain"
+# and "views" layers (the layer is inferred from the file path).
+#
+# Three possible outcomes per import:
+#   - "banned"  -> hard fail (return 1), import is explicitly forbidden
+#   - "unknown" -> needs approval (return 3), import not in allowed or banned list
+#   - "allowed" -> pass, import is explicitly allowed or no allowlist defined
+#
+# When unknown imports are found, they are written to a pending-approvals JSON
+# file that the `approve` script can process. The approve flow invokes a
+# dependency-resolver agent that decides whether to add them to the allowlist.
+#
+# Submodule imports (e.g. "requests.auth") are normalized to their top-level
+# package ("requests") for matching, since allowlists track top-level names.
+layer1_import_check() {
+  local item_id="$1" worktree="$2"
+
+  local imports_json
+  imports_json=$(get_imports_data)
+  [[ -n "$imports_json" ]] && [[ "$imports_json" != "{}" ]] || return 0
+
+  local changed_files
+  changed_files=$(get_changed_source_files "$worktree")
+  [[ -n "$changed_files" ]] || return 0
+
+  local failed=false
+  local needs_approval=false
+  local approvals_file="$RUNS_DIR/${item_id}.pending-approvals.json"
+
+  # Write imports data to temp file so the inner python3 calls can read it
+  # without shell quoting issues with the JSON content
+  local imports_tmp
+  imports_tmp=$(mktemp)
+  echo "$imports_json" > "$imports_tmp"
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$worktree/$f"
+    [[ -f "$full_path" ]] || continue
+
+    # Determine which layer's allowlist to check against based on file path.
+    # Views layer has its own allowed imports (e.g. SwiftUI is allowed in views
+    # but not domain). Falls back to "domain" layer if "views" is not configured.
+    local layer="domain"
+    if echo "$f" | grep -qE '^(Views/|.*View\.swift|.*Screen\.swift)'; then
+      layer="views"
+    fi
+
+    local imports
+    imports=$(extract_imports "$full_path")
+
+    while IFS= read -r imp; do
+      [[ -n "$imp" ]] || continue
+
+      # Normalize submodule imports (e.g. requests.auth -> requests) so they
+      # match top-level allowlist entries. Keeps original $imp for messages.
+      local normalized_imp
+      normalized_imp=$(echo "$imp" | cut -d. -f1)
+
+      # Python checks: banned list first, then allowed list, then unknown.
+      # If allowed is None (not defined), everything is implicitly allowed.
+      local status
+      status=$(python3 -c "
+import json, sys
+data = json.load(open('$imports_tmp'))
+layer_data = data.get('$layer', data.get('domain', {}))
+if not layer_data:
+    sys.exit(0)
+allowed = layer_data.get('allowed', None)
+banned = layer_data.get('banned', [])
+imp = '$normalized_imp'
+if imp in banned:
+    print('banned')
+elif allowed is None:
+    print('allowed')
+elif imp in allowed:
+    print('allowed')
+else:
+    print('unknown')
+" 2>/dev/null || echo "allowed")
+
+      if [[ "$status" == "banned" ]]; then
+        echo "  FAIL: Banned import '$imp' in $layer layer ($f)" >&2
+        record_rejection "$item_id" "deterministic" "import_violation" "Banned import: $imp in $layer" "$f" ""
+        failed=true
+      elif [[ "$status" == "unknown" ]]; then
+        echo "  APPROVAL NEEDED: Unknown import '$imp' in $layer layer ($f)" >&2
+        local context_lines
+        context_lines=$(grep -n "$imp" "$full_path" 2>/dev/null | head -3 || echo "")
+        write_import_approval "$approvals_file" "$imp" "$layer" "$f" "$context_lines"
+        needs_approval=true
+      fi
+    done <<< "$imports"
+  done <<< "$changed_files"
+
+  rm -f "$imports_tmp"
+
+  # Hard failures take priority over needs_approval: no point approving
+  # dependencies if the code has banned imports
+  if [[ "$failed" == "true" ]]; then
+    return 1
+  elif [[ "$needs_approval" == "true" ]]; then
+    return 3
+  fi
+  return 0
+}
+
+# Appends an unknown import to the pending-approvals JSON file.
+# Context lines (grep -n output showing where the import appears) are passed
+# via environment variable to avoid shell quoting issues with the content.
+write_import_approval() {
+  local approvals_file="$1" name="$2" layer="$3" file="$4" context="$5"
+  GATE_IMPORT_CONTEXT="$context" python3 -c "
+import json, os, sys
+f = sys.argv[1]
+if os.path.exists(f):
+    with open(f) as fh:
+        data = json.load(fh)
+else:
+    data = {'imports': [], 'packages': []}
+data['imports'].append({
+    'name': sys.argv[2],
+    'layer': sys.argv[3],
+    'file': sys.argv[4],
+    'context': os.environ.get('GATE_IMPORT_CONTEXT', '')
+})
+with open(f, 'w') as fh:
+    json.dump(data, fh, indent=2)
+" "$approvals_file" "$name" "$layer" "$file"
+}
+
+# Package allowlist check: detects new dependencies added to the project's
+# package manifest (Package.swift, pyproject.toml, requirements.txt, package.json,
+# go.mod, Cargo.toml) and validates them against the allowed/review_required lists.
+#
+# Only runs if the manifest file was actually changed in this diff. Parses the
+# diff to find added dependency lines, extracts package names using language-specific
+# regex patterns, then classifies each as allowed/review_required/unknown.
+#
+# Returns: 0 if all packages are allowed, 3 if unknown packages need approval.
+# Unknown packages are written to pending-approvals.json for the approve flow.
+layer1_package_check() {
+  local item_id="$1" worktree="$2"
+
+  local packages_json
+  packages_json=$(get_packages_data)
+  [[ -n "$packages_json" ]] || return 0
+
+  local manifest
+  manifest=$(get_config "packages.manifest")
+  [[ -n "$manifest" ]] || return 0
+
+  local pkg_file="$worktree/$manifest"
+  [[ -f "$pkg_file" ]] || return 0
+
+  # Skip if the manifest file wasn't changed in this diff
+  local pkg_changed
+  pkg_changed=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only 2>/dev/null | grep -q "$manifest" && echo "yes" || echo "no")
+  [[ "$pkg_changed" == "yes" ]] || return 0
+
+  local new_deps
+  local diff_output
+  diff_output=$(git -C "$worktree" diff "$DEFAULT_BRANCH" -- "$manifest" 2>/dev/null)
+  [[ -n "$diff_output" ]] || return 0
+
+  # Python manifests need special parsing because dependency lines are inside
+  # TOML arrays (dependencies = [...]) or requirements.txt flat lists. The
+  # parser tracks bracket depth and TOML sections to distinguish dependency
+  # lines from other added lines in the diff.
+  if [[ "$manifest" == *pyproject* ]] || [[ "$manifest" == *requirements* ]]; then
+    # Python manifests: parse diff sections to find added packages.
+    # For pyproject.toml, added dep lines look like +    "pkg-name",
+    # and do NOT contain "dependencies" - only the section header does.
+    # For requirements.txt, every added line is a dep.
+    new_deps=$(python3 -c "
+import sys, re
+
+manifest = sys.argv[1]
+diff = sys.stdin.read()
+lines = diff.split('\n')
+
+results = []
+
+if 'requirements' in manifest:
+    # requirements.txt: every added line is a dependency
+    for line in lines:
+        if line.startswith('+') and not line.startswith('+++'):
+            stripped = line[1:].strip()
+            if stripped and not stripped.startswith('#'):
+                results.append(line)
+else:
+    # pyproject.toml: track whether we are inside a dependency list.
+    # Two levels of context:
+    #   in_opt_deps_section: inside [project.optional-dependencies] TOML section
+    #   in_dep_list: inside a [...] list that holds package names
+    # The list opener (dependencies = [) may appear as:
+    #   1. A normal context/added line (space or + prefix)
+    #   2. Only in the @@ hunk header when it is far from the change
+    in_opt_deps_section = False
+    in_dep_list = False
+    bracket_depth = 0
+
+    def is_dep_list_start(text):
+        \"\"\"Match 'dependencies = [' or 'xxx = [' inside optional-deps.\"\"\"
+        if re.search(r'dependencies\s*=\s*\[', text):
+            return True
+        return False
+
+    def is_any_list_start(text):
+        \"\"\"Match any 'name = [' pattern (for optional-deps groups).\"\"\"
+        return bool(re.match(r'\s*\w[\w.-]*\s*=\s*\[', text))
+
+    for line in lines:
+        if line.startswith('---') or line.startswith('+++'):
+            continue
+
+        if line.startswith('@@'):
+            # Hunk header context after the @@ markers
+            hunk_ctx = re.sub(r'^@@[^@]*@@\s*', '', line)
+            if hunk_ctx:
+                if is_dep_list_start(hunk_ctx):
+                    in_dep_list = True
+                    bracket_depth = 1
+                elif re.search(r'optional.dependencies', hunk_ctx):
+                    in_opt_deps_section = True
+                    if is_any_list_start(hunk_ctx):
+                        in_dep_list = True
+                        bracket_depth = 1
+                else:
+                    if bracket_depth == 0:
+                        in_dep_list = False
+                    # A non-dep TOML section in hunk header ends opt-deps
+                    if re.match(r'\s*\[', hunk_ctx) and \
+                       not re.search(r'dependencies', hunk_ctx):
+                        in_opt_deps_section = False
+            continue
+
+        # Get content without the diff prefix (+, -, space)
+        if line and line[0] in ('+', '-', ' '):
+            content = line[1:]
+        else:
+            continue
+
+        # Detect TOML section headers
+        toml_header = re.match(r'\s*\[([^\]]+)\]', content)
+        if toml_header:
+            section_name = toml_header.group(1)
+            if 'optional-dependencies' in section_name or \
+               'optional_dependencies' in section_name:
+                in_opt_deps_section = True
+                in_dep_list = False
+                bracket_depth = 0
+            elif 'dependencies' not in section_name:
+                in_opt_deps_section = False
+                in_dep_list = False
+                bracket_depth = 0
+            continue
+
+        # Detect dependency list headers: dependencies = [ or xxx = [ in opt-deps
+        if is_dep_list_start(content) or \
+           (in_opt_deps_section and is_any_list_start(content)):
+            in_dep_list = True
+            bracket_depth = content.count('[') - content.count(']')
+            if bracket_depth <= 0:
+                # Single-line list
+                if line.startswith('+'):
+                    results.append(line)
+                in_dep_list = False
+                bracket_depth = 0
+            continue
+
+        if in_dep_list:
+            bracket_depth += content.count('[') - content.count(']')
+            if bracket_depth <= 0:
+                # Closing bracket - check if it also has a dep
+                if line.startswith('+'):
+                    stripped = content.strip().rstrip(',').strip()
+                    if stripped and stripped not in (']', '['):
+                        results.append(line)
+                in_dep_list = False
+                bracket_depth = 0
+                continue
+            # Inside the list: added lines are deps
+            if line.startswith('+'):
+                stripped = content.strip()
+                if stripped and not stripped.startswith('#'):
+                    results.append(line)
+
+for r in results:
+    print(r)
+" "$manifest" <<< "$diff_output")
+  else
+    # Non-Python manifests (Swift, JS, Go, Rust): use a simple grep with the
+    # configurable dep_pattern to find added dependency lines in the diff.
+    local dep_pattern
+    dep_pattern=$(get_config "packages.new_dep_pattern")
+    [[ -n "$dep_pattern" ]] || return 0
+    # Match added lines (start with +) containing the dep pattern, exclude the +++ header
+    new_deps=$(echo "$diff_output" | grep "^+.*${dep_pattern}" | grep -v '^+++')
+  fi
+  [[ -n "$new_deps" ]] || return 0
+
+  echo ":: Checking new package dependencies" >&2
+
+  local needs_approval=false
+  local approvals_file="$RUNS_DIR/${item_id}.pending-approvals.json"
+
+  # Write packages data to temp file so python3 calls can read without quoting issues
+  local packages_tmp
+  packages_tmp=$(mktemp)
+  echo "$packages_json" > "$packages_tmp"
+
+  while IFS= read -r dep_line; do
+    [[ -n "$dep_line" ]] || continue
+
+    # Extract the package name from the dependency line using language-specific
+    # regex patterns. Each manifest format has its own structure:
+    #   - pyproject/requirements: "package-name>=1.0" -> "package-name"
+    #   - Package.swift: url: ".../<name>.git" -> "<name>"
+    #   - package.json: "@scope/name": "^1.0" -> "@scope/name"
+    #   - go.mod: "module/path v1.0" -> "module/path"
+    #   - Cargo.toml: "name = ..." -> "name"
+    local pkg_name
+    pkg_name=$(python3 -c "
+import re, sys
+line = sys.argv[1]
+manifest = '$manifest'
+m = None
+if 'pyproject' in manifest or 'requirements' in manifest:
+    m = re.search(r'\"?([a-zA-Z][\w.-]*)', line.lstrip('+').strip())
+elif 'Package.swift' in manifest:
+    m = re.search(r'url:\s*\"[^\"]*?/([^/\"]+?)(?:\.git)?\"', line)
+elif 'package.json' in manifest:
+    m = re.search(r'\"(@?[^\"]+)\":', line.lstrip('+').strip())
+elif 'go.mod' in manifest:
+    m = re.search(r'([\w./]+)\s', line.lstrip('+').strip())
+elif 'Cargo.toml' in manifest:
+    m = re.search(r'^([a-zA-Z][\w-]*)', line.lstrip('+').strip())
+print(m.group(1).strip() if m else '')
+" "$dep_line" 2>/dev/null || echo "")
+
+    [[ -n "$pkg_name" ]] || continue
+
+    # Check the package against allowed and review_required lists.
+    # Both lists can contain plain strings ("requests") or dicts ({"name": "requests"}).
+    # The list comprehension normalizes both forms to plain strings for lookup.
+    local status
+    status=$(python3 -c "
+import json, sys
+data = json.load(open('$packages_tmp'))
+allowed = [p['name'] if isinstance(p, dict) else p for p in data.get('allowed', [])]
+review = [p['name'] if isinstance(p, dict) else p for p in data.get('review_required', [])]
+pkg = sys.argv[1]
+if pkg in allowed:
+    print('allowed')
+elif pkg in review:
+    print('review_required')
+else:
+    print('unknown')
+" "$pkg_name" 2>/dev/null || echo "allowed")
+
+    if [[ "$status" == "review_required" ]]; then
+      echo "  WARN: Package '$pkg_name' is in review_required list" >&2
+    elif [[ "$status" == "unknown" ]]; then
+      echo "  APPROVAL NEEDED: Unknown package '$pkg_name'" >&2
+      write_package_approval "$approvals_file" "$pkg_name" "$manifest" "$dep_line"
+      needs_approval=true
+    fi
+  done <<< "$new_deps"
+
+  rm -f "$packages_tmp"
+
+  if [[ "$needs_approval" == "true" ]]; then
+    return 3
+  fi
+  return 0
+}
+
+# Appends an unknown package to the pending-approvals JSON file.
+# Deduplicates by package name so re-running the gate doesn't create duplicates.
+write_package_approval() {
+  local approvals_file="$1" name="$2" manifest="$3" diff_line="$4"
+  python3 -c "
+import json, os, sys
+f = sys.argv[1]
+if os.path.exists(f):
+    with open(f) as fh:
+        data = json.load(fh)
+else:
+    data = {'imports': [], 'packages': []}
+pkg_name = sys.argv[2]
+existing = [p['name'] for p in data['packages']]
+if pkg_name not in existing:
+    data['packages'].append({
+        'name': pkg_name,
+        'manifest': sys.argv[3],
+        'diff_line': sys.argv[4]
+    })
+    with open(f, 'w') as fh:
+        json.dump(data, fh, indent=2)
+" "$approvals_file" "$name" "$manifest" "$diff_line"
+}
+
+# Build check: runs the configured build command in the worktree.
+# The command is eval'd in a subshell (cd to worktree) and output is prefixed
+# with two spaces for indentation. PIPESTATUS[0] captures the build exit code
+# through the pipe to the while-read loop.
+layer1_build() {
+  local worktree="$1"
+  echo ":: [L1] Build check" >&2
+
+  local build_cmd
+  build_cmd=$(get_config "commands.build")
+  if [[ -n "$build_cmd" ]]; then
+    echo "  Running: $build_cmd" >&2
+    (cd "$worktree" && eval "$build_cmd") 2>&1 | while IFS= read -r line; do
+      echo "  $line" >&2
+    done
+    return "${PIPESTATUS[0]}"
+  fi
+
+  echo "  SKIP: no commands.build configured" >&2
+  return 0
+}
+
+# Test check: runs the configured test command in the worktree.
+layer1_test() {
+  local worktree="$1"
+  echo ":: [L1] Test check" >&2
+
+  local test_cmd
+  test_cmd=$(get_config "commands.test")
+  if [[ -n "$test_cmd" ]]; then
+    echo "  Running: $test_cmd" >&2
+    (cd "$worktree" && eval "$test_cmd") 2>&1 | while IFS= read -r line; do
+      echo "  $line" >&2
+    done
+    return "${PIPESTATUS[0]}"
+  fi
+
+  echo "  SKIP: no commands.test configured" >&2
+  return 0
+}
+
+# Lint check: runs the configured lint command in the worktree.
+layer1_lint() {
+  local worktree="$1"
+  echo ":: [L1] Lint check" >&2
+
+  local lint_cmd
+  lint_cmd=$(get_config "commands.lint")
+  if [[ -n "$lint_cmd" ]]; then
+    echo "  Running: $lint_cmd" >&2
+    (cd "$worktree" && eval "$lint_cmd") 2>&1 | while IFS= read -r line; do
+      echo "  $line" >&2
+    done
+    return "${PIPESTATUS[0]}"
+  fi
+
+  echo "  SKIP: no commands.lint configured" >&2
+  return 0
+}
+
+# TDD enforcement: verifies that every newly added source file has a
+# corresponding test file. Only checks files that:
+#   1. Are in a configured source directory (testing.source_dirs)
+#   2. Have a project file extension (project.file_extensions)
+#   3. Are NOT themselves test files (identified by test_prefix/test_suffix)
+#
+# For each qualifying source file, constructs the expected test file path
+# by combining the test directory with the test naming convention. Example:
+#   Source: Sources/Auth/LoginService.swift
+#   Expected test: Tests/Auth/LoginServiceTests.swift
+#     (with test_suffix="Tests", test_dirs="Tests/", source_dirs="Sources/")
+#
+# Skipped entirely if testing.source_dirs or testing.test_dirs are not configured.
+layer1_test_coverage() {
+  local item_id="$1" worktree="$2"
+
+  local source_dirs test_dirs test_prefix test_suffix
+  source_dirs=$(get_config "testing.source_dirs")
+  [[ -n "$source_dirs" ]] || return 0
+  test_dirs=$(get_config "testing.test_dirs")
+  [[ -n "$test_dirs" ]] || return 0
+  test_prefix=$(get_config "testing.test_prefix")
+  test_suffix=$(get_config "testing.test_suffix")
+
+  # Only check newly added files (not modified ones)
+  local new_files
+  new_files=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only --diff-filter=A 2>/dev/null)
+  [[ -n "$new_files" ]] || return 0
+
+  local extensions
+  extensions=$(get_config "project.file_extensions")
+  [[ -n "$extensions" ]] || return 0
+
+  local failed=false
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+
+    # Filter 1: file must be under a configured source directory
+    local is_source=false
+    while IFS= read -r sd; do
+      [[ -n "$sd" ]] || continue
+      if [[ "$f" == "${sd}"* ]]; then
+        is_source=true
+        break
+      fi
+    done <<< "$source_dirs"
+    [[ "$is_source" == "true" ]] || continue
+
+    # Filter 2: file must have a recognized source extension
+    local has_ext=false
+    while IFS= read -r ext; do
+      [[ -n "$ext" ]] || continue
+      if [[ "$f" == *"${ext}" ]]; then
+        has_ext=true
+        break
+      fi
+    done <<< "$extensions"
+    [[ "$has_ext" == "true" ]] || continue
+
+    # Filter 3: skip test files themselves (don't require tests-for-tests)
+    local is_test=false
+    local basename
+    basename=$(basename "$f")
+    if [[ -n "$test_prefix" ]] && [[ "$basename" == "${test_prefix}"* ]]; then
+      is_test=true
+    fi
+    if [[ -n "$test_suffix" ]]; then
+      local name_no_ext="${basename%.*}"
+      if [[ "$name_no_ext" == *"${test_suffix}" ]]; then
+        is_test=true
+      fi
+    fi
+    [[ "$is_test" == "false" ]] || continue
+
+    # Construct the expected test file path by mirroring the source file's
+    # relative path into each test directory, applying prefix/suffix naming
+    local rel_path="${f#${sd}}"
+    local dir_part
+    dir_part=$(dirname "$rel_path")
+    local file_base
+    file_base=$(basename "$rel_path")
+    local name_no_ext="${file_base%.*}"
+    local file_ext="${file_base##*.}"
+
+    local found_test=false
+    while IFS= read -r td; do
+      [[ -n "$td" ]] || continue
+      local expected
+      if [[ "$dir_part" == "." ]]; then
+        expected="${td}${test_prefix}${name_no_ext}${test_suffix}.${file_ext}"
+      else
+        expected="${td}${dir_part}/${test_prefix}${name_no_ext}${test_suffix}.${file_ext}"
+      fi
+      if [[ -f "$worktree/$expected" ]]; then
+        found_test=true
+        break
+      fi
+    done <<< "$test_dirs"
+
+    if [[ "$found_test" == "false" ]]; then
+      echo "  FAIL: New source file '$f' has no corresponding test file" >&2
+      record_rejection "$item_id" "deterministic" "missing_test" "No test file for new source: $f" "$f" ""
+      failed=true
+    fi
+  done <<< "$new_files"
+
+  [[ "$failed" == "false" ]]
+}
+
+# --- Layer 1 orchestrator ---
+# Runs all Layer 1 checks in three phases:
+#   Phase 1: Scope checks (bounded-impact, new file cap) - fail-fast on violations
+#   Phase 2: Import/package checks - track needs_approval separately from failures
+#   Phase 3: Build/test/lint - standard CI checks
+#
+# Returns via stdout: "EMPTY", "PASS", "FAIL", or "NEEDS_APPROVAL"
+# FAIL takes priority over NEEDS_APPROVAL (no point approving deps if other checks broke).
+run_layer1() {
+  local item_id="$1" worktree="$2"
+  local failed=false
+  local needs_approval=false
+
+  # Clear stale pending-approvals from previous gate runs so re-runs don't
+  # accumulate duplicate approval requests
+  rm -f "$RUNS_DIR/${item_id}.pending-approvals.json"
+
+  echo ":: Layer 1 - Deterministic checks" >&2
+
+  # --- Phase 1: Scope checks (fail-fast) ---
+
+  echo ":: [L1] Bounded impact diff" >&2
+  local diff_result
+  diff_result=$(layer1_diff_check "$item_id" "$worktree")
+  if [[ "$diff_result" == "EMPTY" ]]; then
+    echo ":: Empty diff detected. Passing without evaluator." >&2
+    record_check "$item_id" 1 "scope_check" "skip" "empty diff"
+    echo "EMPTY"
+    return
+  elif [[ "$diff_result" == "FAIL" ]]; then
+    record_check "$item_id" 1 "scope_check" "fail"
+    echo "FAIL"
+    return
+  else
+    record_check "$item_id" 1 "scope_check" "pass"
+  fi
+
+  echo ":: [L1] New file cap" >&2
+  if ! layer1_new_file_cap "$item_id" "$worktree"; then
+    record_check "$item_id" 1 "new_file_cap" "fail"
+    echo "FAIL"
+    return
+  else
+    record_check "$item_id" 1 "new_file_cap" "pass"
+  fi
+
+  # --- Phase 2: Import/package checks (track needs_approval) ---
+  # Import and package checks use a three-way exit code convention:
+  #   0 = pass, 1 = hard fail (banned), 3 = needs_approval (unknown)
+
+  echo ":: [L1] Import allowlist" >&2
+  local import_exit=0
+  layer1_import_check "$item_id" "$worktree" || import_exit=$?
+  if [[ "$import_exit" == "1" ]]; then
+    record_check "$item_id" 1 "import_check" "fail"
+    failed=true
+  elif [[ "$import_exit" == "3" ]]; then
+    record_check "$item_id" 1 "import_check" "needs_approval"
+    needs_approval=true
+  else
+    record_check "$item_id" 1 "import_check" "pass"
+  fi
+
+  echo ":: [L1] Package allowlist" >&2
+  local package_exit=0
+  layer1_package_check "$item_id" "$worktree" || package_exit=$?
+  if [[ "$package_exit" == "1" ]]; then
+    record_check "$item_id" 1 "package_check" "fail"
+    failed=true
+  elif [[ "$package_exit" == "3" ]]; then
+    record_check "$item_id" 1 "package_check" "needs_approval"
+    needs_approval=true
+  else
+    record_check "$item_id" 1 "package_check" "pass"
+  fi
+
+  # --- Phase 3: Build/test/lint checks ---
+
+  if ! layer1_build "$worktree"; then
+    record_check "$item_id" 1 "build" "fail"
+    failed=true
+  else
+    record_check "$item_id" 1 "build" "pass"
+  fi
+
+  if ! layer1_test "$worktree"; then
+    record_check "$item_id" 1 "test" "fail"
+    failed=true
+  else
+    record_check "$item_id" 1 "test" "pass"
+  fi
+
+  echo ":: [L1] Test coverage" >&2
+  if ! layer1_test_coverage "$item_id" "$worktree"; then
+    record_check "$item_id" 1 "test_coverage" "fail"
+    failed=true
+  else
+    local has_testing
+    has_testing=$(get_config "testing.source_dirs")
+    if [[ -n "$has_testing" ]]; then
+      record_check "$item_id" 1 "test_coverage" "pass"
+    else
+      record_check "$item_id" 1 "test_coverage" "skip" "no testing config"
+    fi
+  fi
+
+  if ! layer1_lint "$worktree"; then
+    record_check "$item_id" 1 "lint" "fail"
+    failed=true
+  else
+    record_check "$item_id" 1 "lint" "pass"
+  fi
+
+  # --- Final result ---
+  # FAIL wins over NEEDS_APPROVAL: no point approving deps if other checks broke.
+  # NEEDS_APPROVAL only returned when everything else passed.
+
+  if [[ "$failed" == "true" ]]; then
+    echo "FAIL"
+  elif [[ "$needs_approval" == "true" ]]; then
+    echo "NEEDS_APPROVAL"
+  else
+    echo "PASS"
+  fi
+}
+
+# --- Layer 2: Structural lint ---
+# These checks run for medium and heavy items only. Each check is a function
+# named layer2_<check_name>. The check names are configured in
+# gate.layer2_checks (factory.json). The run_layer2 orchestrator dynamically
+# dispatches to the matching function.
+
+# @MainActor enforcement (Swift): any file using @Observable must also have
+# @MainActor. Without it, SwiftUI state updates may happen off the main thread,
+# causing undefined behavior. This is a common Swift concurrency mistake.
+layer2_mainactor() {
+  local item_id="$1" worktree="$2"
+  local changed_files
+  changed_files=$(get_changed_source_files "$worktree")
+  [[ -n "$changed_files" ]] || return 0
+
+  local failed=false
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$worktree/$f"
+    [[ -f "$full_path" ]] || continue
+
+    if grep -q '@Observable' "$full_path" 2>/dev/null; then
+      if ! grep -q '@MainActor' "$full_path" 2>/dev/null; then
+        echo "  FAIL: @Observable without @MainActor in $f" >&2
+        record_rejection "$item_id" "lint" "missing_mainactor" "@Observable class missing @MainActor" "$f" ""
+        failed=true
+      fi
+    fi
+  done <<< "$changed_files"
+
+  [[ "$failed" == "false" ]]
+}
+
+# FetchDescriptor guard (Swift/SwiftData): warns when a FetchDescriptor is used
+# without a predicate, which would load the entire table into memory.
+layer2_fetch_descriptor() {
+  local item_id="$1" worktree="$2"
+  local changed_files
+  changed_files=$(get_changed_source_files "$worktree")
+  [[ -n "$changed_files" ]] || return 0
+
+  local failed=false
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$worktree/$f"
+    [[ -f "$full_path" ]] || continue
+
+    if grep -q 'FetchDescriptor' "$full_path" 2>/dev/null; then
+      if ! grep -q 'predicate' "$full_path" 2>/dev/null; then
+        echo "  WARN: FetchDescriptor without predicate in $f" >&2
+        record_rejection "$item_id" "lint" "fetch_no_predicate" "FetchDescriptor without predicate" "$f" ""
+        failed=true
+      fi
+    fi
+  done <<< "$changed_files"
+
+  [[ "$failed" == "false" ]]
+}
+
+# ATS bypass detection (iOS/macOS): fails if NSAllowsArbitraryLoads is set
+# to true in Info.plist, which disables App Transport Security for the entire
+# app and allows unencrypted HTTP connections.
+layer2_ats_bypass() {
+  local item_id="$1" worktree="$2"
+  local info_plist="$worktree/Info.plist"
+  [[ -f "$info_plist" ]] || return 0
+
+  if grep -q 'NSAllowsArbitraryLoads' "$info_plist" 2>/dev/null; then
+    if grep -A1 'NSAllowsArbitraryLoads' "$info_plist" | grep -q 'true'; then
+      echo "  FAIL: ATS bypass enabled (NSAllowsArbitraryLoads = true)" >&2
+      record_rejection "$item_id" "lint" "ats_bypass" "TLS disabled for entire app" "$info_plist" ""
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Secrets scan: detects hardcoded credentials in changed files using a regex
+# pattern that matches common secret-like assignments (password, api_key, token,
+# etc.) with values of 8+ characters. Not a full secrets scanner - catches the
+# most common patterns to prevent obvious credential leaks.
+layer2_secrets() {
+  local item_id="$1" worktree="$2"
+  local changed
+  changed=$(git -C "$worktree" diff "$DEFAULT_BRANCH" --name-only 2>/dev/null)
+  [[ -n "$changed" ]] || return 0
+
+  local patterns='(password|secret|api_key|apikey|token|private_key)\s*[:=]\s*"[^"]{8,}'
+  local failed=false
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$worktree/$f"
+    [[ -f "$full_path" ]] || continue
+
+    if grep -iEn "$patterns" "$full_path" 2>/dev/null | head -3 | while IFS= read -r match; do
+      local line_no
+      line_no=$(echo "$match" | cut -d: -f1)
+      echo "  FAIL: Possible hardcoded secret in $f:$line_no" >&2
+      record_rejection "$item_id" "lint" "hardcoded_secret" "Possible hardcoded credential" "$f" "$line_no"
+      failed=true
+    done; then
+      :
+    fi
+  done <<< "$changed"
+
+  [[ "$failed" == "false" ]]
+}
+
+# Shared-capability duplication check: detects when an agent creates a new
+# function that already exists in shared-capabilities.md (the registry of
+# reusable functions). Prevents duplicate implementations of common patterns.
+#
+# Extracts function names from the diff (added lines containing "func ")
+# using a sed pipeline that strips everything except the function name.
+# Then cross-references against the capabilities registry.
+layer2_shared_capability() {
+  local item_id="$1" worktree="$2"
+  [[ -f "$SHARED_CAP" ]] || return 0
+
+  # Extract function names from added lines in the diff:
+  # grep '^+.*func ' - only added lines with function declarations
+  # grep -v '^+++' - exclude the diff file header
+  # sed pipeline: strip + prefix, everything before "func ", params after "("
+  local new_funcs
+  new_funcs=$(git -C "$worktree" diff "$DEFAULT_BRANCH" 2>/dev/null | grep '^+.*func ' | grep -v '^+++' | sed 's/^+//' | sed 's/.*func //' | sed 's/(.*//' | tr -d ' ')
+  [[ -n "$new_funcs" ]] || return 0
+
+  # Extract function names from the shared capabilities registry.
+  # Format in the file is: "- functionName(" so we strip "- " and "("
+  local cap_funcs
+  cap_funcs=$(grep -o '- [a-zA-Z]*(' "$SHARED_CAP" 2>/dev/null | sed 's/^- //' | sed 's/($//')
+
+  local failed=false
+  while IFS= read -r func; do
+    [[ -n "$func" ]] || continue
+    if echo "$cap_funcs" | grep -qx "$func" 2>/dev/null; then
+      echo "  FAIL: New function '$func' duplicates shared capability" >&2
+      record_rejection "$item_id" "lint" "duplicate_capability" "Function $func exists in shared-capabilities.md"
+      failed=true
+    fi
+  done <<< "$new_funcs"
+
+  [[ "$failed" == "false" ]]
+}
+
+# --- Layer 2 orchestrator ---
+# Reads the list of check names from gate.layer2_checks, resolves each to a
+# function named layer2_<check_name>, and calls it. Unknown check names are
+# skipped with a warning (allows forward-compatible config that references
+# checks not yet implemented in this version of the gate).
+run_layer2() {
+  local item_id="$1" worktree="$2"
+  local failed=false
+
+  echo ":: Layer 2 - Structural lint" >&2
+
+  local checks
+  checks=$(get_config "gate.layer2_checks")
+  [[ -n "$checks" ]] || { echo "PASS"; return; }
+
+  # Dynamic dispatch: each check_name maps to a layer2_<name> function
+  while IFS= read -r check_name; do
+    [[ -n "$check_name" ]] || continue
+    local func_name="layer2_${check_name}"
+    if declare -f "$func_name" > /dev/null 2>&1; then
+      echo ":: [L2] $check_name" >&2
+      if ! "$func_name" "$item_id" "$worktree"; then
+        record_check "$item_id" 2 "$check_name" "fail"
+        failed=true
+      else
+        record_check "$item_id" 2 "$check_name" "pass"
+      fi
+    else
+      echo ":: [L2] WARN: unknown check '$check_name', skipping" >&2
+      record_check "$item_id" 2 "$check_name" "skip" "unknown check function"
+    fi
+  done <<< "$checks"
+
+  [[ "$failed" == "false" ]] && echo "PASS" || echo "FAIL"
+}
+
+# --- Layer 3: Evaluator ---
+# Invokes the `score` script, which runs an LLM-based evaluator agent that
+# reviews the diff against the item's specification. The evaluator produces
+# per-dimension scores and a final band (pass/fail/review).
+#
+# On fail or review, the evaluator's detailed feedback is preserved in
+# .runs/<item_id>.evaluator-feedback.txt so the agent can use it as context
+# on retry. On pass, the feedback file is cleaned up.
+
+run_layer3() {
+  local item_id="$1"
+  echo ":: Layer 3 - Evaluator" >&2
+
+  # The score script writes its breakdown to stderr and the final band to stdout.
+  # We capture stderr separately so we can both display it and save it.
+  local score_output score_stderr
+  score_stderr=$(mktemp)
+  score_output=$("$FACTORY_DIR/score" "$item_id" 2>"$score_stderr") || true
+  local band
+  band=$(echo "$score_output" | tail -1)
+
+  # Show breakdown on stderr for real-time visibility
+  cat "$score_stderr" >&2
+
+  # Write breakdown to runs dir for agent retry context
+  local feedback_file="$RUNS_DIR/${item_id}.evaluator-feedback.txt"
+  cat "$score_stderr" > "$feedback_file"
+
+  if [[ "$band" == "pass" ]]; then
+    record_check "$item_id" 3 "evaluator" "pass"
+    rm -f "$feedback_file"
+  elif [[ "$band" == "fail" ]]; then
+    record_check "$item_id" 3 "evaluator" "fail" "$(grep 'FAIL:' "$score_stderr" | head -5 | tr '\n' '; ')"
+    echo ":: Evaluator feedback written to $feedback_file" >&2
+  elif [[ "$band" == "review" ]]; then
+    record_check "$item_id" 3 "evaluator" "warn" "human review required"
+    echo ":: Evaluator feedback written to $feedback_file" >&2
+  fi
+
+  rm -f "$score_stderr"
+  echo "$band"
+}
+
+# --- main ---
+
+# Writes the gate result ("pass", "fail", "needs_approval", "review") back into
+# the run context JSON file. This is read by `complete` to decide whether to merge.
+write_gate_result() {
+  local item_id="$1" result="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || return 0
+  python3 -c "
+import json
+f = '$runs_file'
+with open(f) as fh:
+  data = json.load(fh)
+data['gate_result'] = '$result'
+with open(f, 'w') as fh:
+  json.dump(data, fh, indent=2)
+" 2>/dev/null || true
+}
+
+# Main entry point. Orchestrates the full gate pipeline:
+# 1. Load run context (gate weight, worktree path) from .runs/<item_id>.json
+# 2. Start telemetry (gate execution record, diff stats)
+# 3. Check for gate weight escalation based on actual diff size
+# 4. Run Layer 1 (all items) - fail/pass/empty/needs_approval
+# 5. Run Layer 2 (medium + heavy only) - structural lint checks
+# 6. Run Layer 3 (configurable, default heavy only) - evaluator agent scoring
+# 7. Write final result and finalize telemetry
+#
+# Each layer can short-circuit the pipeline: Layer 1 failure stops before Layer 2,
+# Layer 2 failure stops before Layer 3.
+main() {
+  local item_id="${1:-}"
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id>"
+
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "No run context: $runs_file"
+
+  # Load gate weight and worktree path from the run context set by resolve
+  local gate_weight
+  gate_weight=$(get_run_field "$item_id" "gate_weight")
+  local worktree
+  worktree=$(get_run_field "$item_id" "worktree")
+
+  [[ -d "$worktree" ]] || die "Worktree not found: $worktree"
+
+  # Start telemetry tracking
+  local gate_start_ms exec_id original_weight
+  gate_start_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
+  original_weight="$gate_weight"
+
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id" 2>/dev/null || echo "")
+
+  # Create the gate execution record in telemetry DB
+  exec_id=$("$FACTORY_DIR/db" insert-gate-exec "${run_id:-0}" "$item_id" "$gate_weight" \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" 2>/dev/null || echo "")
+
+  echo ":: Running gate for $item_id (weight: $gate_weight)" >&2
+
+  # Check if the diff exceeds thresholds and escalate weight if needed
+  gate_weight=$(check_gate_escalation "$item_id" "$gate_weight" "$worktree")
+
+  # Track whether escalation happened (for telemetry)
+  local escalated_weight=""
+  [[ "$gate_weight" != "$original_weight" ]] && escalated_weight="$gate_weight"
+
+  # Record per-file diff statistics before running checks
+  record_diff_stats "$exec_id" "$item_id" "$worktree"
+
+  # --- Layer 1: Deterministic checks (all items) ---
+  local l1_result
+  l1_result=$(run_layer1 "$item_id" "$worktree")
+  if [[ "$l1_result" == "EMPTY" ]]; then
+    echo ":: GATE PASSED (empty diff)" >&2
+    write_gate_result "$item_id" "pass"
+    finalize_gate_exec "$exec_id" "pass" "" "$gate_start_ms" "$escalated_weight"
+    echo "pass"
+    exit 0
+  elif [[ "$l1_result" == "FAIL" ]]; then
+    echo ":: GATE FAILED at Layer 1" >&2
+    write_gate_result "$item_id" "fail"
+    finalize_gate_exec "$exec_id" "fail" "1" "$gate_start_ms" "$escalated_weight"
+    echo "fail"
+    exit 1
+  elif [[ "$l1_result" == "NEEDS_APPROVAL" ]]; then
+    echo ":: GATE NEEDS APPROVAL - unknown imports/packages detected" >&2
+    echo ":: Pending approvals: $RUNS_DIR/${item_id}.pending-approvals.json" >&2
+    write_gate_result "$item_id" "needs_approval"
+    finalize_gate_exec "$exec_id" "needs_approval" "1" "$gate_start_ms" "$escalated_weight"
+    echo "needs_approval"
+    exit 3
+  fi
+  echo ":: Layer 1 passed" >&2
+
+  # --- Layer 2: Structural lint (medium + heavy only) ---
+  if [[ "$gate_weight" == "medium" ]] || [[ "$gate_weight" == "heavy" ]]; then
+    local l2_result
+    l2_result=$(run_layer2 "$item_id" "$worktree")
+    if [[ "$l2_result" == "FAIL" ]]; then
+      echo ":: GATE FAILED at Layer 2" >&2
+      write_gate_result "$item_id" "fail"
+      finalize_gate_exec "$exec_id" "fail" "2" "$gate_start_ms" "$escalated_weight"
+      echo "fail"
+      exit 1
+    fi
+    echo ":: Layer 2 passed" >&2
+  fi
+
+  # --- Layer 3: Evaluator (configurable per weight, default heavy only) ---
+  local evaluator_weights
+  evaluator_weights=$(get_config "gate.evaluator_weights" "heavy")
+  # Check if this item's gate weight is in the list of weights that run L3
+  if echo "$evaluator_weights" | grep -qw "$gate_weight"; then
+    local l3_result
+    l3_result=$(run_layer3 "$item_id")
+    if [[ "$l3_result" == "fail" ]]; then
+      echo ":: GATE FAILED at Layer 3 (evaluator)" >&2
+      write_gate_result "$item_id" "fail"
+      finalize_gate_exec "$exec_id" "fail" "3" "$gate_start_ms" "$escalated_weight"
+      echo "fail"
+      exit 1
+    elif [[ "$l3_result" == "review" ]]; then
+      echo ":: GATE REVIEW - human review required" >&2
+      write_gate_result "$item_id" "review"
+      finalize_gate_exec "$exec_id" "review" "" "$gate_start_ms" "$escalated_weight"
+      echo "review"
+      exit 0
+    fi
+    echo ":: Layer 3 passed" >&2
+  fi
+
+  # All applicable layers passed
+  echo ":: GATE PASSED" >&2
+  write_gate_result "$item_id" "pass"
+  finalize_gate_exec "$exec_id" "pass" "" "$gate_start_ms" "$escalated_weight"
+  echo "pass"
+  exit 0
+}
+
+main "$@"

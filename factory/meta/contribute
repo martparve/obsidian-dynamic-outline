@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# contribute - One-way upstream diff generator
+#
+# Compares local engine files against an upstream factory repository and produces
+# a unified patch of all differences. Only diffs files listed in the "engine"
+# section of .factory-manifest - never touches project-owned files.
+#
+# The generated patch can be applied to the upstream repo to incorporate local
+# engine improvements back into the shared factory codebase.
+#
+# Usage: ./meta/contribute /path/to/upstream-factory-repo
+#
+# Reads:    .factory-manifest (engine section for file list)
+#           Local and upstream copies of each engine file
+# Writes:   meta/.contribute-patch (unified diff output)
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FACTORY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+MANIFEST="$FACTORY_DIR/.factory-manifest"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Read file entries from the "engine" section of .factory-manifest
+parse_engine_files() {
+  # Parser: lines after "# engine" header until a blank line or another # header
+  local in_section=false
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && { in_section=false; continue; }
+    [[ "$line" =~ ^#.*engine ]] && { in_section=true; continue; }
+    [[ "$line" =~ ^# ]] && { in_section=false; continue; }
+    [[ "$in_section" == "true" ]] && echo "$line"
+  done < "$MANIFEST"
+}
+
+# Expand a manifest entry: directories (trailing /) become file lists, files stay as-is
+expand_entry() {
+  local base="$1" entry="$2"
+  if [[ "$entry" == */ ]]; then
+    local dir="${entry%/}"
+    [[ -d "$base/$dir" ]] || return 0
+    find "$base/$dir" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      echo "${f#"$base"/}"
+    done
+  else
+    [[ -f "$base/$entry" ]] && echo "$entry"
+  fi
+}
+
+# Return SHA-256 hash of a file, or "missing" if it doesn't exist
+file_hash() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1
+  else
+    echo "missing"
+  fi
+}
+
+# --- main ---
+
+main() {
+  local upstream="${1:-}"
+  [[ -n "$upstream" ]] || die "Usage: $0 /path/to/upstream-factory-repo"
+  [[ -d "$upstream" ]] || die "Upstream path does not exist: $upstream"
+  [[ -f "$MANIFEST" ]] || die "Missing .factory-manifest"
+
+  local patch_file="$SCRIPT_DIR/.contribute-patch"
+  : > "$patch_file"
+
+  echo ":: Comparing local engine against upstream" >&2
+  echo "" >&2
+
+  local changed=0 unchanged=0
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      local local_file="$FACTORY_DIR/$f"
+      local upstream_file="$upstream/$f"
+
+      [[ -f "$local_file" ]] || continue
+
+      local local_hash upstream_hash
+      local_hash=$(file_hash "$local_file")
+      upstream_hash=$(file_hash "$upstream_file")
+
+      if [[ "$local_hash" == "$upstream_hash" ]]; then
+        unchanged=$((unchanged + 1))
+      else
+        local lines_changed
+        if [[ -f "$upstream_file" ]]; then
+          lines_changed=$(diff -u "$upstream_file" "$local_file" 2>/dev/null | grep -c '^[+-]' || true)
+          diff -u "$upstream_file" "$local_file" >> "$patch_file" 2>/dev/null || true
+        else
+          lines_changed=$(wc -l < "$local_file" | tr -d ' ')
+          diff -u /dev/null "$local_file" >> "$patch_file" 2>/dev/null || true
+        fi
+        echo "  CHANGED: $f ($lines_changed lines)" >&2
+        changed=$((changed + 1))
+      fi
+    done < <(expand_entry "$FACTORY_DIR" "$entry")
+  done < <(parse_engine_files)
+
+  echo "" >&2
+  if [[ "$changed" -eq 0 ]]; then
+    echo ":: No local engine changes to contribute" >&2
+    rm -f "$patch_file"
+  else
+    echo ":: $changed file(s) changed, $unchanged unchanged" >&2
+    echo ":: Patch written to: $patch_file" >&2
+    echo ":: To apply: cd $upstream && patch -p0 < $patch_file" >&2
+  fi
+}
+
+main "$@"

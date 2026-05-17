@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# resolve - Pipeline entry point: assembles context and emits an agent prompt
+#
+# Performs a 17-step sequence: validates concurrency cap and item status, checks
+# file ownership overlap and dependency completion, registers the item as
+# in-progress (under a mkdir lock), validates atomicity constraints, classifies
+# sensitivity from tiers config, assigns gate weight, selects the agent based on
+# stage and prior failure count, resolves context modules via module-map, pins
+# spec SHAs for drift detection, creates a git worktree, writes the run context
+# JSON, records telemetry via ./db, and emits the assembled agent prompt between
+# ---PROMPT-START--- / ---PROMPT-END--- markers on stdout.
+#
+# Called by: ./run (autonomous loop), or manually by the operator
+# Calls: ./triage (--next mode), ./db (telemetry inserts)
+# Produces: .runs/<item_id>.json, worktree at /tmp/<item_id>, agent prompt on stdout
+#
+# Usage:
+#   ./resolve FM-001            # Resolve a specific item
+#   ./resolve --next            # Let triage pick the highest-priority ready item
+#   ./resolve --next 2          # Pick from 2 available slots
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+BACKLOG_DIR="$FACTORY_DIR/backlog"
+IN_PROGRESS="$FACTORY_DIR/.in-progress"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+LOCK_FILE="$FACTORY_DIR/.resolve.lock"
+TIERS_FILE="$FACTORY_DIR/context/tiers.json"
+ATOMICITY_FILE="$FACTORY_DIR/context/atomicity.json"
+MODULE_MAP="$FACTORY_DIR/context/module-map.json"
+CONCURRENCY_CAP=3
+TTL_MINUTES=45
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Determine the default branch (origin/HEAD, then main, then master)
+detect_default_branch() {
+  local branch
+  branch=$(git -C "$PROJECT_ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -n "$branch" ]] && { echo "$branch"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify main >/dev/null 2>&1 && { echo "main"; return; }
+  git -C "$PROJECT_ROOT" rev-parse --verify master >/dev/null 2>&1 && { echo "master"; return; }
+  echo "main"
+}
+
+DEFAULT_BRANCH=$(detect_default_branch)
+
+# Read a dot-path key from factory.json, with optional default
+get_config() {
+  local key="$1" default="${2:-}"
+  local config="$FACTORY_DIR/factory.json"
+  [[ -f "$config" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+d=json.load(open('$config'))
+for k in '$key'.split('.'):
+  if isinstance(d,dict): d=d.get(k,'')
+  else: d=''
+if isinstance(d,list): print('\n'.join(str(v) for v in d))
+elif isinstance(d,dict): print(json.dumps(d))
+else: print(d if d!='' else '$default')
+" 2>/dev/null || echo "$default"
+}
+
+# --- consolidated config readers (factory.json with legacy fallback) ---
+
+# Read tiers config from factory.json gate.tiers, falling back to legacy tiers.json
+get_tiers_data() {
+  local from_config
+  from_config=$(get_config "gate.tiers" "")
+  if [[ -n "$from_config" ]] && [[ "$from_config" != "{}" ]]; then
+    echo "$from_config"
+    return
+  fi
+  local legacy="$TIERS_FILE"
+  [[ -f "$legacy" ]] && cat "$legacy" || echo "{}"
+}
+
+# Extract import module names from a source file using the configured regex pattern
+extract_imports() {
+  local file="$1"
+  local pattern
+  pattern=$(get_config "imports.pattern")
+  [[ -n "$pattern" ]] || return 0
+  python3 -c "
+import re
+pattern = r'$pattern'
+with open('$file') as f:
+  for line in f:
+    m = re.match(pattern, line.strip())
+    if m and m.group(1):
+      print(m.group(1))
+" 2>/dev/null || true
+}
+
+# Read a scalar field from YAML frontmatter in a backlog item
+get_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | sed "s/^${field}: *//" | tr -d '"' || true
+}
+
+# Read a list field (YAML dash-items) from YAML frontmatter
+get_list_field() {
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" | sed -n "/^${field}:$/,/^[^ ]/p" | grep '^ *- ' | sed 's/^ *- *//' || true
+}
+
+# Extract the markdown body (everything outside YAML frontmatter)
+get_body() {
+  local file="$1"
+  sed -n '/^---$/,/^---$/!p' "$file" | sed '1{/^$/d;}'
+}
+
+# Purge expired entries from .in-progress (TTL_MINUTES), record crashes for dead PIDs
+ttl_cleanup() {
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  local now iid ts pid
+  now=$(date +%s)
+  local cleaned=""
+  while IFS=$'\t' read -r iid ts pid; do
+    [[ -n "$iid" ]] || continue
+    local age=$(( now - ts ))
+    local ttl_secs=$(( TTL_MINUTES * 60 ))
+    if [[ "$age" -gt "$ttl_secs" ]]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "WARN: $iid TTL expired but PID $pid alive (slow agent)" >&2
+        cleaned+="${iid}\t${ts}\t${pid}"$'\n'
+      else
+        echo ":: $iid crashed (PID $pid dead, TTL expired). Recording." >&2
+        "$FACTORY_DIR/db" insert-run "$iid" "unknown" "resolve" 1 "light" "" "crash" \
+          "$(date -r "$ts" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')" \
+          "$(date '+%Y-%m-%dT%H:%M:%S')" "" "" 2>/dev/null || true
+      fi
+    else
+      cleaned+="${iid}\t${ts}\t${pid}"$'\n'
+    fi
+  done < "$IN_PROGRESS"
+  printf '%b' "$cleaned" > "$IN_PROGRESS"
+}
+
+# Return the number of items currently in progress
+count_in_progress() {
+  [[ -f "$IN_PROGRESS" ]] || { echo 0; return; }
+  local count
+  count=$(grep -c '[^[:space:]]' "$IN_PROGRESS" 2>/dev/null) || count=0
+  echo "$count"
+}
+
+# Emit one item_id per line for all in-progress items
+get_in_progress_item_ids() {
+  [[ -f "$IN_PROGRESS" ]] || return 0
+  local iid _ts _pid
+  while IFS=$'\t' read -r iid _ts _pid; do
+    [[ -n "$iid" ]] && echo "$iid"
+  done < "$IN_PROGRESS"
+}
+
+# Collect all file paths claimed by in-progress items (for overlap detection)
+get_in_progress_files() {
+  local ip_ids
+  ip_ids=$(get_in_progress_item_ids)
+  while IFS= read -r iid; do
+    [[ -n "$iid" ]] || continue
+    local item_file="$BACKLOG_DIR/${iid}.md"
+    [[ -f "$item_file" ]] || continue
+    get_list_field "$item_file" "files"
+  done <<< "$ip_ids"
+}
+
+# Die if any file in this item's file list is already claimed by another in-progress item
+check_file_overlap() {
+  local item_file="$1" item_id="$2"
+  local ip_files=""
+  local ip_ids
+  ip_ids=$(get_in_progress_item_ids)
+  while IFS= read -r iid; do
+    [[ -n "$iid" ]] || continue
+    [[ "$iid" != "$item_id" ]] || continue
+    local ifile="$BACKLOG_DIR/${iid}.md"
+    [[ -f "$ifile" ]] || continue
+    ip_files+="$(get_list_field "$ifile" "files")"$'\n'
+  done <<< "$ip_ids"
+  [[ -n "$ip_files" ]] || return 0
+  local item_files
+  item_files=$(get_list_field "$item_file" "files")
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if echo "$ip_files" | grep -qx "$f" 2>/dev/null; then
+      die "File overlap: $f is claimed by an in-progress item"
+    fi
+  done <<< "$item_files"
+}
+
+# Verify all depends-on items are completed (fixed or wont-fix)
+check_deps() {
+  local item_file="$1"
+  local deps
+  deps=$(get_list_field "$item_file" "depends-on")
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    local dep_file="$BACKLOG_DIR/${dep}.md"
+    [[ -f "$dep_file" ]] || die "Dependency $dep not found"
+    local dep_status
+    dep_status=$(get_field "$dep_file" "status")
+    [[ "$dep_status" == "fixed" || "$dep_status" == "wont-fix" ]] || \
+      die "Dependency $dep not completed (status: $dep_status)"
+  done <<< "$deps"
+}
+
+# Append item to .in-progress with current timestamp and PID
+register_in_progress() {
+  local item_id="$1"
+  local now
+  now=$(date +%s)
+  printf '%s\t%s\t%s\n' "$item_id" "$now" "$$" >> "$IN_PROGRESS"
+}
+
+# Auto-expand paired files in the item's files list before atomicity check
+expand_paired_files() {
+  local item_file="$1"
+  local files
+  files=$(get_list_field "$item_file" "files")
+  local item_id
+  item_id=$(get_field "$item_file" "id")
+
+  # Auto-pair bin/test -> meta/test
+  if echo "$files" | grep -qx "bin/test" 2>/dev/null; then
+    if ! echo "$files" | grep -qx "meta/test" 2>/dev/null; then
+      # Append meta/test to the files list in the frontmatter
+      sed -i.bak '/^files:$/,/^[^ ]/{
+        /^[^ ]/!{
+          /^ *- bin\/test$/a\
+  - meta/test
+        }
+      }' "$item_file"
+      rm -f "${item_file}.bak"
+      echo ":: Auto-paired: meta/test" >&2
+    fi
+  fi
+
+  # Auto-pair self-hosted: for each bin/X or meta/X, add factory/bin/X or factory/meta/X
+  # Only applies in self-hosted factories where engine files exist at PROJECT_ROOT level
+  local is_self_hosted=false
+  [[ -d "$PROJECT_ROOT/bin" ]] && [[ -d "$PROJECT_ROOT/factory/bin" ]] && is_self_hosted=true
+
+  if [[ "$is_self_hosted" == "true" ]]; then
+    files=$(get_list_field "$item_file" "files")
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      case "$f" in
+        bin/*|meta/*)
+          local factory_copy="factory/$f"
+          if [[ -f "$PROJECT_ROOT/$factory_copy" ]]; then
+            if ! echo "$files" | grep -qx "$factory_copy" 2>/dev/null; then
+              sed -i.bak "/^files:$/,/^[^ ]/{
+                /^ *- $(echo "$f" | sed 's/\//\\\//g')$/a\\
+  - $factory_copy
+              }" "$item_file"
+              rm -f "${item_file}.bak"
+              echo ":: Auto-paired: $factory_copy" >&2
+              files=$(get_list_field "$item_file" "files")
+            fi
+          fi
+          ;;
+      esac
+    done <<< "$files"
+  fi
+}
+
+# Enforce max file count per item (from atomicity.json), with agent-based exceptions
+check_atomicity() {
+  local item_file="$1"
+  [[ -f "$ATOMICITY_FILE" ]] || return 0
+
+  # Count files excluding backlog self-references (metadata, not code changes)
+  local file_count
+  file_count=$(get_list_field "$item_file" "files" | grep -v '^factory/backlog/.*\.md$' | grep -v '^backlog/.*\.md$' | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+
+  local max_files=""
+  max_files=$(grep 'max_files_modified' "$ATOMICITY_FILE" 2>/dev/null | grep -o '[0-9]*' | head -1 || true)
+  [[ -n "$max_files" ]] || max_files=5
+
+  local agent
+  agent=$(get_field "$item_file" "agent")
+  local tags
+  tags=$(get_list_field "$item_file" "tags" 2>/dev/null || true)
+  local exceptions
+  exceptions=$(grep '"allowed_exceptions"' "$ATOMICITY_FILE" 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | grep -v 'allowed_exceptions' || true)
+
+  local is_exception=false
+  if [[ -n "$agent" ]]; then
+    echo "$exceptions" | grep -qx "$agent" 2>/dev/null && is_exception=true
+  fi
+
+  if [[ "$is_exception" == "false" ]] && [[ "$file_count" -gt "$max_files" ]]; then
+    die "Atomicity violation: $file_count files exceeds max $max_files"
+  fi
+}
+
+# Classify item as "sensitive" or "normal" based on file paths and tags in tiers config
+classify_sensitivity() {
+  local item_file="$1"
+
+  local tiers_json
+  tiers_json=$(get_tiers_data)
+  [[ -n "$tiers_json" ]] && [[ "$tiers_json" != "{}" ]] || { echo "normal"; return; }
+
+  local files
+  files=$(get_list_field "$item_file" "files")
+  local tags
+  tags=$(get_list_field "$item_file" "tags" 2>/dev/null || true)
+
+  local sensitive_paths
+  sensitive_paths=$(echo "$tiers_json" | grep -o '"[^"]*/"' | tr -d '"' | head -5)
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    while IFS= read -r sp; do
+      [[ -n "$sp" ]] || continue
+      if echo "$f" | grep -q "^${sp}"; then
+        echo "sensitive"
+        return
+      fi
+    done <<< "$sensitive_paths"
+  done <<< "$files"
+
+  local sensitive_tags
+  sensitive_tags=$(echo "$tiers_json" | grep '"sensitive_tags"' | grep -o '\[.*\]' | tr -d '[]"' | tr ',' '\n' | tr -d ' ')
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    if echo "$tags" | grep -qx "$t" 2>/dev/null; then
+      echo "sensitive"
+      return
+    fi
+  done <<< "$sensitive_tags"
+
+  echo "normal"
+}
+
+# Assign gate weight (light/medium/heavy) based on stage and sensitivity
+assign_gate_weight() {
+  local stage="$1" sensitivity="$2"
+  if [[ "$sensitivity" == "sensitive" ]]; then
+    echo "heavy"
+    return
+  fi
+
+  local tiers_json
+  tiers_json=$(get_tiers_data)
+  if [[ -n "$tiers_json" ]] && [[ "$tiers_json" != "{}" ]]; then
+    local tiers_tmp
+    tiers_tmp=$(mktemp)
+    echo "$tiers_json" > "$tiers_tmp"
+    local weight
+    weight=$(python3 -c "
+import json
+d=json.load(open('$tiers_tmp'))
+w=d.get('scheduling_weights',{}).get('$stage','')
+print(w if w else '')
+" 2>/dev/null || true)
+    rm -f "$tiers_tmp"
+    [[ -n "$weight" ]] && { echo "$weight"; return; }
+  fi
+  echo "medium"
+}
+
+# Count prior gate failures for this item (used to escalate to diagnostician agent)
+check_prior_failures() {
+  local item_id="$1"
+  [[ -f "$DB_PATH" ]] || { echo 0; return; }
+  local count
+  count=$("$FACTORY_DIR/db" query \
+    "SELECT COUNT(*) FROM gate_runs WHERE item_id='$item_id' AND outcome='fail';" 2>/dev/null || echo 0)
+  echo "${count:-0}"
+}
+
+# Choose agent: explicit frontmatter override, stage-based mapping, or diagnostician after 2 failures
+select_agent() {
+  local item_file="$1" prior_failures="$2"
+  local explicit_agent
+  explicit_agent=$(get_field "$item_file" "agent" 2>/dev/null || true)
+  [[ -n "$explicit_agent" ]] && { echo "$explicit_agent"; return; }
+
+  local stage
+  stage=$(get_field "$item_file" "stage" 2>/dev/null || true)
+
+  local effective_stage="${stage:-impl}"
+
+  if [[ "$effective_stage" == "impl" && "$prior_failures" -ge 2 ]]; then
+    echo "diagnostician"
+    return
+  fi
+
+  local agent
+  agent=$(get_config "pipeline.stage_agents.${effective_stage}")
+  if [[ -n "$agent" ]]; then
+    echo "$agent"
+  else
+    echo "builder"
+  fi
+}
+
+# Resolve context modules by matching item files, imports, tags, and keywords against module-map
+select_modules() {
+  local item_file="$1"
+  [[ -f "$MODULE_MAP" ]] || return 0
+
+  local modules=""
+
+  local files
+  files=$(get_list_field "$item_file" "files")
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local full_path="$PROJECT_ROOT/$f"
+    if [[ -f "$full_path" ]]; then
+      local imports
+      imports=$(extract_imports "$full_path")
+      while IFS= read -r imp; do
+        [[ -n "$imp" ]] || continue
+        local mod
+        mod=$(grep "\"$imp\"" "$MODULE_MAP" 2>/dev/null | grep -o ': *"[^"]*"' | tr -d '": ' | head -1)
+        [[ -n "$mod" ]] && modules+="$mod"$'\n'
+      done <<< "$imports"
+    fi
+
+    local by_path_keys
+    by_path_keys=$(sed -n '/"by_path"/,/}/p' "$MODULE_MAP" | grep '"' | grep -v 'by_path' | sed 's/.*"\([^"]*\)".*/\1/' | head -10 || true)
+    while IFS= read -r prefix; do
+      [[ -n "$prefix" ]] || continue
+      if echo "$f" | grep -q "^${prefix}"; then
+        local mod
+        mod=$(grep "\"$prefix\"" "$MODULE_MAP" | grep -o ': *"[^"]*"' | tr -d '": ' | head -1 || true)
+        [[ -n "$mod" ]] && modules+="$mod"$'\n'
+      fi
+    done <<< "$by_path_keys"
+  done <<< "$files"
+
+  local tags
+  tags=$(get_list_field "$item_file" "tags" 2>/dev/null || true)
+  local title
+  title=$(get_field "$item_file" "title")
+
+  local keywords_modules
+  keywords_modules=$(python3 -c "
+import json,sys
+try:
+  d=json.load(open('$MODULE_MAP'))
+  mods=d.get('modules',{})
+  if not mods: sys.exit(0)
+  tags=[t.strip() for t in '''$tags'''.strip().split('\n') if t.strip()]
+  title='''$title'''.strip().lower()
+  for name,cfg in mods.items():
+    kws=cfg.get('keywords',[])
+    for kw in kws:
+      kl=kw.lower()
+      if kl in title or kl in [t.lower() for t in tags]:
+        print(name)
+        break
+except: pass
+" 2>/dev/null || true)
+  [[ -n "$keywords_modules" ]] && modules+="$keywords_modules"$'\n'
+
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    local mod
+    mod=$(grep "\"$t\"" "$MODULE_MAP" 2>/dev/null | grep -o ': *"[^"]*"' | tr -d '": ' | head -1 || true)
+    [[ -n "$mod" ]] && modules+="$mod"$'\n'
+  done <<< "$tags"
+
+  echo "$modules" | sort -u | grep -v '^$' || true
+}
+
+# Record git object SHAs for spec-ref files (drift detection)
+pin_shas() {
+  local item_file="$1"
+  local shas=""
+  local spec_ref
+  spec_ref=$(get_field "$item_file" "spec-ref")
+  if [[ -n "$spec_ref" ]]; then
+    local spec_file
+    spec_file=$(echo "$spec_ref" | sed 's/ lines.*//')
+    if [[ -f "$PROJECT_ROOT/$spec_file" ]]; then
+      local sha
+      sha=$(git -C "$PROJECT_ROOT" hash-object "$PROJECT_ROOT/$spec_file" 2>/dev/null || echo "unknown")
+      shas+="\"$spec_file\": \"$sha\""
+    fi
+  fi
+  echo "{${shas}}"
+}
+
+# Write .runs/<item_id>.json with run metadata; enforces 12-invocation hard halt
+write_runs_json() {
+  local item_id="$1" run_id="$2" gate_weight="$3" agent="$4"
+  local worktree="$5" modules="$6" shas="$7"
+
+  mkdir -p "$RUNS_DIR"
+
+  local modules_json="["
+  local first=true
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    if [[ "$first" == "true" ]]; then
+      modules_json+="\"$m\""
+      first=false
+    else
+      modules_json+=", \"$m\""
+    fi
+  done <<< "$modules"
+  modules_json+="]"
+
+  local invocation_count=1
+  if [[ -f "$RUNS_DIR/${item_id}.json" ]]; then
+    local prev_count
+    prev_count=$(grep '"invocation_count"' "$RUNS_DIR/${item_id}.json" | grep -o '[0-9]*' | head -1)
+    [[ -n "$prev_count" ]] && invocation_count=$(( prev_count + 1 ))
+  fi
+
+  # Safety valve: prevent infinite resolve loops on a stuck item
+  if [[ "$invocation_count" -gt 12 ]]; then
+    die "Hard halt: $item_id has $invocation_count invocations (max 12)"
+  fi
+
+  cat > "$RUNS_DIR/${item_id}.json" <<ENDJSON
+{
+  "run_id": ${run_id},
+  "item_id": "${item_id}",
+  "gate_weight": "${gate_weight}",
+  "agent": "${agent}",
+  "worktree": "${worktree}",
+  "modules": ${modules_json},
+  "pinned_shas": ${shas},
+  "invocation_count": ${invocation_count},
+  "started_at": "$(date '+%Y-%m-%dT%H:%M:%S')"
+}
+ENDJSON
+}
+
+# Create (or recreate) a git worktree at /tmp/<item_id> on a fix/ branch
+create_worktree() {
+  local item_id="$1"
+  local worktree_path="/tmp/${item_id}"
+
+  if [[ -d "$worktree_path" ]]; then
+    git -C "$PROJECT_ROOT" worktree remove --force "$worktree_path" 2>/dev/null || true
+  fi
+
+  local branch_exists
+  branch_exists=$(git -C "$PROJECT_ROOT" branch --list "fix/${item_id}" 2>/dev/null)
+  if [[ -n "$branch_exists" ]]; then
+    git -C "$PROJECT_ROOT" worktree add "$worktree_path" "fix/${item_id}" >&2 || die "Failed to create worktree at $worktree_path (existing branch fix/${item_id})"
+  else
+    git -C "$PROJECT_ROOT" worktree add "$worktree_path" -b "fix/${item_id}" "$DEFAULT_BRANCH" >&2 || die "Failed to create worktree at $worktree_path (new branch fix/${item_id})"
+  fi
+
+  [[ -d "$worktree_path" ]] || die "Worktree directory does not exist after creation: $worktree_path"
+  echo "$worktree_path"
+}
+
+# Build the full agent prompt: agent def, platform conventions, modules, task, file contents, instructions
+assemble_prompt() {
+  local item_file="$1" agent="$2" modules="$3" worktree="$4"
+
+  local agent_def="$FACTORY_DIR/agents/${agent}.md"
+  [[ -f "$agent_def" ]] || die "Agent definition not found: $agent_def"
+
+  echo "# Agent Definition"
+  echo ""
+  cat "$agent_def"
+  echo ""
+  echo "---"
+  echo ""
+
+  if [[ -f "$FACTORY_DIR/context/platform-conventions.md" ]]; then
+    echo "# Platform Conventions"
+    echo ""
+    cat "$FACTORY_DIR/context/platform-conventions.md"
+    echo ""
+    echo "---"
+    echo ""
+  fi
+
+  while IFS= read -r mod; do
+    [[ -n "$mod" ]] || continue
+    local mod_file="$FACTORY_DIR/context/modules/${mod}.md"
+    if [[ -f "$mod_file" ]]; then
+      echo "# Context Module: $mod"
+      echo ""
+      cat "$mod_file"
+      echo ""
+      echo "---"
+      echo ""
+    fi
+  done <<< "$modules"
+
+  echo "# Task"
+  echo ""
+  echo "## Item: $(get_field "$item_file" "id") - $(get_field "$item_file" "title")"
+  echo ""
+  get_body "$item_file"
+  echo ""
+
+  local files
+  files=$(get_list_field "$item_file" "files")
+  if [[ -n "$files" ]]; then
+    echo "---"
+    echo ""
+    echo "# Current File Contents"
+    echo ""
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      local full_path="$worktree/$f"
+      if [[ -f "$full_path" ]]; then
+        echo "## $f"
+        echo '```'
+        cat "$full_path"
+        echo '```'
+        echo ""
+      else
+        echo "## $f (new file - does not exist yet)"
+        echo ""
+      fi
+    done <<< "$files"
+  fi
+
+  local context_files
+  context_files=$(get_list_field "$item_file" "context")
+  if [[ -n "$context_files" ]]; then
+    echo "---"
+    echo ""
+    echo "# Additional Context"
+    echo ""
+    while IFS= read -r cf; do
+      [[ -n "$cf" ]] || continue
+      local ctx_path="$FACTORY_DIR/$cf"
+      [[ -f "$ctx_path" ]] || ctx_path="$PROJECT_ROOT/$cf"
+      if [[ -f "$ctx_path" ]]; then
+        echo "## $(basename "$cf")"
+        echo '```'
+        cat "$ctx_path"
+        echo '```'
+        echo ""
+      fi
+    done <<< "$context_files"
+  fi
+
+  echo "---"
+  echo ""
+  echo "# Instructions"
+  echo ""
+  echo "Work in the worktree at: $worktree"
+  echo "Branch: fix/$(get_field "$item_file" "id")"
+  echo "Commit with: impl($(get_field "$item_file" "id")): <short description>"
+  echo ""
+  echo "Only modify files declared in the item's files list."
+  echo "When done, commit your changes and report what you did."
+}
+
+# Ask triage to pick the highest-priority ready item for available slot(s)
+resolve_next() {
+  local slots="${1:-$CONCURRENCY_CAP}"
+  local ip_count
+  ip_count=$(count_in_progress)
+  local available=$(( slots - ip_count ))
+  [[ "$available" -gt 0 ]] || die "No slots available ($ip_count/$slots in progress)"
+
+  local next_id
+  next_id=$("$FACTORY_DIR/triage" --next "$available" 2>/dev/null | head -1)
+  [[ -n "$next_id" ]] || die "No ready items found by triage"
+  echo "$next_id"
+}
+
+# --- main ---
+
+main() {
+  local item_id="${1:-}"
+
+  if [[ "$item_id" == "--next" ]]; then
+    item_id=$(resolve_next "${2:-$CONCURRENCY_CAP}")
+    echo ":: Selected: $item_id" >&2
+  fi
+
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id> or $0 --next [slots]"
+
+  local item_file="$BACKLOG_DIR/${item_id}.md"
+  [[ -f "$item_file" ]] || die "Backlog item not found: $item_file"
+
+  local status
+  status=$(get_field "$item_file" "status")
+  [[ "$status" == "open" ]] || die "$item_id status is '$status', expected 'open'"
+
+  # Steps 1-7: concurrency-controlled registration (under mkdir-based lock)
+  # mkdir is atomic on POSIX - only one process can create it
+  mkdir "$LOCK_FILE" 2>/dev/null || die "Another resolve is running (could not acquire lock)"
+  trap 'rmdir "$LOCK_FILE" 2>/dev/null' EXIT
+
+  ttl_cleanup
+
+  local ip_count
+  ip_count=$(count_in_progress)
+  if [[ "$ip_count" -ge "$CONCURRENCY_CAP" ]]; then
+    echo ":: In-progress items ($ip_count/$CONCURRENCY_CAP):" >&2
+    get_in_progress_item_ids >&2
+    die "Concurrency cap reached"
+  fi
+
+  check_file_overlap "$item_file" "$item_id"
+  check_deps "$item_file"
+  register_in_progress "$item_id"
+
+  rmdir "$LOCK_FILE" 2>/dev/null
+  trap - EXIT
+
+  echo ":: Registered $item_id" >&2
+
+  # Step 8: auto-pair files and atomicity check
+  expand_paired_files "$item_file"
+  check_atomicity "$item_file"
+
+  # Step 9: sensitivity classification
+  local sensitivity
+  sensitivity=$(classify_sensitivity "$item_file")
+  echo ":: Sensitivity: $sensitivity" >&2
+
+  # Step 10: gate weight
+  local stage
+  stage=$(get_field "$item_file" "stage" 2>/dev/null || echo "impl")
+  [[ -n "$stage" ]] || stage="impl"
+  local gate_weight
+  gate_weight=$(assign_gate_weight "$stage" "$sensitivity")
+  echo ":: Gate weight: $gate_weight" >&2
+
+  # Step 11: prior failures
+  local prior_failures
+  prior_failures=$(check_prior_failures "$item_id")
+
+  # Step 12: agent selection
+  local agent
+  agent=$(select_agent "$item_file" "$prior_failures")
+  echo ":: Agent: $agent" >&2
+
+  # Step 13: context modules
+  local modules
+  modules=$(select_modules "$item_file")
+  if [[ -n "$modules" ]]; then
+    echo ":: Modules: $(echo "$modules" | tr '\n' ' ')" >&2
+  fi
+
+  # Step 14: pin SHAs
+  local shas
+  shas=$(pin_shas "$item_file")
+
+  # Step 15-16: write .runs JSON and insert telemetry
+  local worktree
+  worktree=$(create_worktree "$item_id")
+  echo ":: Worktree: $worktree" >&2
+
+  # Symlink dependency dirs so agents don't need to reinstall packages in worktree
+  if [[ -d "$PROJECT_ROOT/.venv" ]] && [[ ! -e "$worktree/.venv" ]]; then
+    ln -s "$PROJECT_ROOT/.venv" "$worktree/.venv"
+    echo ":: Symlinked .venv into worktree" >&2
+  fi
+  if [[ -d "$PROJECT_ROOT/node_modules" ]] && [[ ! -e "$worktree/node_modules" ]]; then
+    ln -s "$PROJECT_ROOT/node_modules" "$worktree/node_modules"
+    echo ":: Symlinked node_modules into worktree" >&2
+  fi
+
+  local run_id
+  run_id=$("$FACTORY_DIR/db" insert-run "$item_id" "$agent" "$stage" 1 "$gate_weight" "" "pass" \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" 2>/dev/null || echo 0)
+
+  # Record item metadata
+  local title priority file_count
+  title=$(get_field "$item_file" "title")
+  priority=$(get_field "$item_file" "priority")
+  file_count=$(get_list_field "$item_file" "files" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+  "$FACTORY_DIR/db" upsert-item "$item_id" "$title" "$priority" "$file_count" "$sensitivity" "$agent" "$gate_weight" 2>/dev/null || true
+
+  write_runs_json "$item_id" "${run_id:-0}" "$gate_weight" "$agent" "$worktree" "$modules" "$shas"
+
+  # Step 17: emit assembled agent prompt
+  echo ":: Emitting agent prompt to stdout" >&2
+  echo "---PROMPT-START---"
+  assemble_prompt "$item_file" "$agent" "$modules" "$worktree"
+  echo "---PROMPT-END---"
+
+  echo "" >&2
+  echo ":: Resolve complete for $item_id" >&2
+  echo ":: Agent: $agent | Weight: $gate_weight | Worktree: $worktree" >&2
+  echo ":: Run context: $RUNS_DIR/${item_id}.json" >&2
+}
+
+main "$@"

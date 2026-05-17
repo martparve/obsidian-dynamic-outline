@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "dynamic-outline",
+    "file_extensions": [
+      ".ts"
+    ]
+  },
+  "commands": {
+    "build": "npm run build",
+    "test": "",
+    "lint": ""
+  },
+  "pipeline": {
+    "stages": [
+      "spec",
+      "test",
+      "impl"
+    ],
+    "skip_stages": [],
+    "stage_agents": {
+      "spec": "spec-writer",
+      "test": "test-writer",
+      "impl": "builder"
+    },
+    "feature_path": "{feature}/"
+  },
+  "imports": {
+    "pattern": "^import\\s+.*from\\s+['\"]([^'\"]+)['\"]",
+    "file_extensions": [
+      ".ts"
+    ],
+    "allowed": {
+      "domain": {
+        "allowed": [
+          "fuzzysort",
+          "main",
+          "obsidian",
+          "src"
+        ],
+        "banned": []
+      }
+    }
+  },
+  "packages": {
+    "manifest": "package.json",
+    "new_dep_pattern": "dependencies",
+    "allowed": [
+      {
+        "name": "fuzzysort"
+      }
+    ],
+    "review_required": []
+  },
+  "gate": {
+    "layer2_checks": [
+      "secrets"
+    ],
+    "dependency_friendliness": "moderate",
+    "evaluator_weights": [
+      "heavy"
+    ],
+    "platform_terms": {
+      "blocked_terms": [],
+      "rationale": "Add platform-specific terms that should not appear in behavior specifications"
+    },
+    "tiers": {
+      "sensitive_paths": [],
+      "sensitive_imports": [],
+      "sensitive_tags": [],
+      "gate_escalation": {
+        "file_count_threshold": 3,
+        "line_count_threshold": 200
+      },
+      "scheduling_weights": {}
+    }
+  }
+}

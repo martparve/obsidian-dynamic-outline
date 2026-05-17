@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# score - Layer 3 evaluator scoring: invokes LLM evaluator with rubric
+#
+# Runs the evaluator agent against the item's diff using a rubric selected by
+# agent type (e.g. arch-conformance for builders, spec-review for spec-writers).
+# Parses the evaluator's JSON output into per-dimension scores, classifies each
+# dimension into pass/fail/review bands using configurable thresholds, and
+# records all scores to telemetry via ./db.
+#
+# Band logic: score > threshold + margin AND high confidence = pass. Score below
+# threshold - margin = fail. Near-threshold with low confidence = review (human
+# required). Severity override: if issues_count exceeds MAX_ISSUES_PER_DIMENSION
+# and score is very low, forces fail.
+#
+# Called by: ./gate (Layer 3 check for heavy/configurable weight items)
+# Calls: ./db (insert-score for each dimension)
+# Reads: .runs/<item_id>.json, quality/rubrics/<rubric>.md
+# Output: overall band (pass/fail/review) on stdout
+#
+# Usage:
+#   ./score FM-001                          # Use EVALUATOR_OUTPUT env var
+#   ./score FM-001 /path/to/evaluator.json  # Provide evaluator output directly
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+RUNS_DIR="$FACTORY_DIR/.runs"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+RUBRICS_DIR="$FACTORY_DIR/quality/rubrics"
+PASS_THRESHOLD=0.7
+CONFIDENCE_THRESHOLD=0.6
+NEAR_THRESHOLD_MARGIN=0.1
+MAX_ISSUES_PER_DIMENSION=3
+MAX_ISSUE_SEVERITY=0.25
+
+# --- functions ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Read a field from .runs/<item_id>.json
+get_run_field() {
+  local item_id="$1" field="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  [[ -f "$runs_file" ]] || die "No run context for $item_id"
+  grep "\"$field\"" "$runs_file" | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/' | head -1
+}
+
+# Choose the evaluation rubric based on agent type (spec-review or arch-conformance)
+select_rubric() {
+  local item_id="$1"
+  local gate_weight
+  gate_weight=$(get_run_field "$item_id" "gate_weight")
+  local agent
+  agent=$(get_run_field "$item_id" "agent")
+
+  case "$agent" in
+    spec-writer)    echo "spec-review" ;;
+    builder|implementer)
+      echo "arch-conformance"
+      ;;
+    diagnostician)  echo "arch-conformance" ;;
+    view-assembler) echo "arch-conformance" ;;
+    wirer)          echo "arch-conformance" ;;
+    *)              echo "arch-conformance" ;;
+  esac
+}
+
+# Validate that evaluator JSON has required structure (dimensions with score and confidence)
+parse_evaluator_output() {
+  local json_file="$1"
+  [[ -f "$json_file" ]] || die "Evaluator output not found: $json_file"
+
+  local valid
+  valid=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$json_file'))
+    assert 'dimensions' in data
+    for d in data['dimensions']:
+        assert 'score' in d and 'confidence' in d and 'dimension' in d
+    print('valid')
+except Exception as e:
+    print(f'invalid: {e}', file=sys.stderr)
+    print('invalid')
+" 2>/dev/null || echo "invalid")
+
+  [[ "$valid" == "valid" ]] || die "Invalid evaluator output format"
+}
+
+# Classify a single dimension into pass/fail/review using score and confidence thresholds
+score_dimension() {
+  local score="$1" confidence="$2"
+
+  # Three zones: clear pass (above threshold+margin), clear fail (below threshold-margin),
+  # and a near-threshold zone where confidence determines the outcome
+  local high_pass
+  high_pass=$(awk "BEGIN{print ($score > $PASS_THRESHOLD + $NEAR_THRESHOLD_MARGIN) ? 1 : 0}")
+  local low_fail
+  low_fail=$(awk "BEGIN{print ($score < $PASS_THRESHOLD - $NEAR_THRESHOLD_MARGIN) ? 1 : 0}")
+  local high_conf
+  high_conf=$(awk "BEGIN{print ($confidence >= $CONFIDENCE_THRESHOLD) ? 1 : 0}")
+
+  if [[ "$high_pass" -eq 1 ]] && [[ "$high_conf" -eq 1 ]]; then
+    echo "pass"
+  elif [[ "$high_pass" -eq 1 ]] && [[ "$high_conf" -eq 0 ]]; then
+    echo "review"
+  elif [[ "$low_fail" -eq 1 ]]; then
+    echo "fail"
+  elif [[ "$high_conf" -eq 1 ]]; then
+    echo "pass"
+  else
+    echo "review"
+  fi
+}
+
+# Iterate all dimensions, record each to telemetry, compute overall band (worst-of)
+process_scores() {
+  local item_id="$1" json_file="$2" run_id="$3"
+
+  local overall_band="pass"
+  local breakdown=""
+
+  local dim_count
+  dim_count=$(python3 -c "
+import json
+data = json.load(open('$json_file'))
+print(len(data['dimensions']))
+" 2>/dev/null || echo 0)
+
+  local i=0
+  while [[ "$i" -lt "$dim_count" ]]; do
+    local dim_data
+    dim_data=$(python3 -c "
+import json
+data = json.load(open('$json_file'))
+d = data['dimensions'][$i]
+print(f\"{d['dimension']}\t{d['score']}\t{d['confidence']}\t{d.get('issues_count', 0)}\")
+" 2>/dev/null)
+
+    local dim_name dim_score dim_conf issues_count
+    IFS=$'\t' read -r dim_name dim_score dim_conf issues_count <<< "$dim_data"
+
+    local band
+    band=$(score_dimension "$dim_score" "$dim_conf")
+
+    # Override: too many issues at very low score forces a fail regardless of band
+    local severity_fail=false
+    if [[ -n "$issues_count" ]] && [[ "$issues_count" -gt "$MAX_ISSUES_PER_DIMENSION" ]]; then
+      local score_check
+      score_check=$(awk "BEGIN{print ($dim_score <= $MAX_ISSUE_SEVERITY) ? 1 : 0}")
+      if [[ "$score_check" -eq 1 ]]; then
+        band="fail"
+        severity_fail=true
+      fi
+    fi
+
+    "$FACTORY_DIR/db" insert-score "$run_id" "$dim_name" "$dim_score" "$dim_conf" "$band" "evaluator" 2>/dev/null || true
+
+    if [[ "$band" == "fail" ]]; then
+      overall_band="fail"
+      breakdown+="  FAIL: $dim_name (score=$dim_score, confidence=$dim_conf"
+      [[ "$severity_fail" == "true" ]] && breakdown+=", issues=$issues_count >$MAX_ISSUES_PER_DIMENSION"
+      breakdown+=")"$'\n'
+    elif [[ "$band" == "review" ]] && [[ "$overall_band" != "fail" ]]; then
+      overall_band="review"
+      breakdown+="  REVIEW: $dim_name (score=$dim_score, confidence=$dim_conf)"$'\n'
+    else
+      breakdown+="  PASS: $dim_name (score=$dim_score, confidence=$dim_conf)"$'\n'
+    fi
+
+    i=$(( i + 1 ))
+  done
+
+  echo ":: Score breakdown for $item_id:" >&2
+  printf '%s' "$breakdown" >&2
+
+  echo "$overall_band"
+}
+
+# Prepare evaluator input (diff + rubric) and return path to evaluator JSON output
+run_evaluator() {
+  local item_id="$1" rubric_name="$2"
+  local runs_file="$RUNS_DIR/${item_id}.json"
+  local worktree
+  worktree=$(get_run_field "$item_id" "worktree")
+
+  local rubric_file="$RUBRICS_DIR/${rubric_name}.md"
+  [[ -f "$rubric_file" ]] || die "Rubric not found: $rubric_file"
+
+  local diff_output
+  diff_output=$(git -C "$worktree" diff main --no-color 2>/dev/null || echo "")
+
+  local output_file
+  output_file=$(mktemp)
+
+  echo ":: Running evaluator for $item_id with rubric $rubric_name" >&2
+  echo ":: Evaluator output expected at: $output_file" >&2
+  echo ":: To provide evaluator output, write JSON to: $output_file" >&2
+
+  if [[ -n "${EVALUATOR_OUTPUT:-}" ]] && [[ -f "$EVALUATOR_OUTPUT" ]]; then
+    cp "$EVALUATOR_OUTPUT" "$output_file"
+  else
+    cat > "$output_file" <<ENDJSON
+{
+  "item_id": "${item_id}",
+  "rubric": "${rubric_name}",
+  "dimensions": [],
+  "weighted_score": 0.0,
+  "fail_conditions_triggered": [],
+  "summary": "No evaluator output provided. Set EVALUATOR_OUTPUT env var to a JSON file."
+}
+ENDJSON
+    echo "WARN: No evaluator output. Set EVALUATOR_OUTPUT=<path> or pipe output." >&2
+  fi
+
+  echo "$output_file"
+}
+
+# --- main ---
+
+main() {
+  local item_id="${1:-}"
+  [[ -n "$item_id" ]] || die "Usage: $0 <item_id> [evaluator_output_file]"
+
+  [[ -f "$DB_PATH" ]] || "$FACTORY_DIR/db" init 2>/dev/null
+
+  local evaluator_json="${2:-}"
+  if [[ -n "$evaluator_json" ]] && [[ -f "$evaluator_json" ]]; then
+    export EVALUATOR_OUTPUT="$evaluator_json"
+  fi
+
+  local run_id
+  run_id=$(get_run_field "$item_id" "run_id" 2>/dev/null || echo "0")
+
+  local rubric_name
+  rubric_name=$(select_rubric "$item_id")
+  echo ":: Rubric: $rubric_name" >&2
+
+  local output_file
+  output_file=$(run_evaluator "$item_id" "$rubric_name")
+
+  parse_evaluator_output "$output_file"
+
+  local band
+  band=$(process_scores "$item_id" "$output_file" "$run_id")
+
+  rm -f "$output_file"
+
+  echo "" >&2
+  echo ":: Overall band: $band" >&2
+
+  if [[ "$band" == "fail" ]]; then
+    echo ":: Retry with score breakdown for focused fixes" >&2
+  elif [[ "$band" == "review" ]]; then
+    echo ":: Low-confidence scores detected. Human review required." >&2
+  fi
+
+  echo "$band"
+}
+
+main "$@"

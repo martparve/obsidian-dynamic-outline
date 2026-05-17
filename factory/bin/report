@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# report - Telemetry dashboard for the factory pipeline
+#
+# Queries the SQLite telemetry database (.telemetry.db) to produce reports
+# on pipeline health, agent economics, quality trends, and throughput.
+#
+# Available sections:
+#   all          - Every section below
+#   summary      - Total gate runs: pass/fail/review/crash counts
+#   checks       - Per-check pass/fail rates across gate layers
+#   dimensions   - Evaluator dimension failure rates (Layer 3)
+#   first-pass   - First-attempt success rate by pipeline stage
+#   noise        - Low-confidence evaluator scores (the "review" band)
+#   consistency  - Rolling stddev of scores per dimension (noisy rubric detection)
+#   economics    - Token spend, throughput, and duration by model
+#   cycle-time   - Time from resolve to complete per item
+#   hotspots     - Most-changed files and their correlation with gate failures
+#   throughput   - Daily items completed, merged, wont-fix
+#   scope        - Declared file count vs actual files changed and churn
+#   escalations  - How often gate weight was escalated mid-run
+#
+# Relationships:
+#   - Reads from .telemetry.db, populated by resolve, gate, complete, and score
+#   - Requires ./db init to have been run first
+#   - Called by: user manually, or by the autonomous run loop for health checks
+#
+# Usage:
+#   ./report                # All sections
+#   ./report dimensions     # Single section
+#   ./report economics      # Token economics only
+# =============================================================================
+
+FACTORY_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+PROJECT_ROOT="$(cd "$FACTORY_DIR/.." && pwd)"
+DB_PATH="$FACTORY_DIR/.telemetry.db"
+
+# --- functions ---
+
+# Print error and exit
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Run a SQL query against the telemetry DB with column headers
+sql() {
+  sqlite3 -cmd ".timeout 5000" -column -header "$DB_PATH" "$1" 2>/dev/null
+}
+
+# Verify the telemetry database exists before querying
+check_db() {
+  [[ -f "$DB_PATH" ]] || die "No telemetry database at $DB_PATH. Run ./db init first."
+}
+
+# Show failure rate for each evaluator scoring dimension
+report_dimension_failures() {
+  echo ":: Dimension Failure Rates"
+  echo ""
+  sql "
+SELECT dimension, COUNT(*) total,
+       SUM(band='fail') fails,
+       ROUND(100.0*SUM(band='fail')/COUNT(*),1) fail_pct
+FROM dimension_scores GROUP BY dimension ORDER BY fail_pct DESC;
+"
+  echo ""
+}
+
+# Show what percentage of items pass the gate on first attempt per stage
+report_first_pass_rate() {
+  echo ":: First-Pass Success Rate by Stage"
+  echo ""
+  sql "
+SELECT stage, COUNT(*) total,
+       SUM(attempt=1 AND outcome='pass') first_pass,
+       ROUND(100.0*SUM(attempt=1 AND outcome='pass')/COUNT(*),1) pct
+FROM gate_runs GROUP BY stage;
+"
+  echo ""
+}
+
+# List evaluator scores in the "review" band where confidence is low
+report_noise_zone() {
+  echo ":: Noise Zone (low-confidence evaluator scores)"
+  echo ""
+  sql "
+SELECT g.item_id, d.dimension, ROUND(d.score,2) score, ROUND(d.confidence,2) confidence
+FROM dimension_scores d JOIN gate_runs g ON g.id = d.run_id
+WHERE d.band = 'review' ORDER BY d.confidence LIMIT 15;
+"
+  echo ""
+}
+
+# Compute stddev of recent scores per dimension to detect noisy rubrics
+report_consistency() {
+  echo ":: Rolling Consistency (stddev of last 50 scores per dimension)"
+  echo ""
+  local dimensions
+  dimensions=$(sql "SELECT DISTINCT dimension FROM dimension_scores;" 2>/dev/null | tail -n +3)
+
+  if [[ -z "$dimensions" ]]; then
+    echo "  No scoring data yet."
+    echo ""
+    return 0
+  fi
+
+  local noisy_count=0  # Track dimensions with stddev > 0.3
+  printf "%-25s %8s %s\n" "DIMENSION" "STDDEV" "STATUS"
+  printf "%-25s %8s %s\n" "---------" "------" "------"
+
+  while IFS= read -r dim; do
+    [[ -n "$dim" ]] || continue
+    dim=$(echo "$dim" | tr -d ' ')
+    local stddev
+    stddev=$(sqlite3 -cmd ".timeout 5000" "$DB_PATH" "
+      SELECT ROUND(
+        SQRT(AVG(score*score) - AVG(score)*AVG(score)), 3
+      ) FROM (
+        SELECT score FROM dimension_scores
+        WHERE dimension='$dim'
+        ORDER BY id DESC LIMIT 50
+      );
+    " 2>/dev/null)
+
+    local status="ok"
+    if [[ -n "$stddev" ]] && awk "BEGIN{exit !($stddev > 0.3)}" 2>/dev/null; then
+      status="NOISY"
+      noisy_count=$((noisy_count + 1))
+    fi
+
+    printf "%-25s %8s %s\n" "$dim" "${stddev:-n/a}" "$status"
+  done <<< "$dimensions"
+
+  echo ""
+  if [[ "$noisy_count" -ge 3 ]]; then
+    echo "  WARNING: $noisy_count dimensions are noisy (stddev > 0.3). Rubric review recommended."
+  fi
+  echo ""
+}
+
+# Show pass/fail/skip/warn counts per gate check across all layers
+report_checks() {
+  echo ":: Per-Check Pass/Fail Rates"
+  echo ""
+  sql "
+SELECT layer, check_name,
+       COUNT(*) total,
+       SUM(outcome='pass') passed,
+       SUM(outcome='fail') failed,
+       SUM(outcome='skip') skipped,
+       SUM(outcome='warn') warned,
+       ROUND(100.0*SUM(outcome='fail')/COUNT(*),1) fail_pct
+FROM gate_checks GROUP BY layer, check_name ORDER BY layer, fail_pct DESC;
+"
+  echo ""
+}
+
+# Show aggregate gate run totals: passed, failed, review, crashed
+report_summary() {
+  echo ":: Summary"
+  echo ""
+  sql "SELECT COUNT(*) as total_runs, SUM(outcome='pass') as passed, SUM(outcome='fail') as failed, SUM(outcome='review') as review, SUM(outcome='crash') as crashed FROM gate_runs;"
+  echo ""
+}
+
+# Show token usage, throughput, and wall-clock time grouped by model
+report_economics() {
+  echo ":: Token Economics by Model"
+  echo ""
+  local result
+  result=$(sql "
+SELECT model,
+       COUNT(*) runs,
+       SUM(total_tokens) total_tokens,
+       ROUND(AVG(tokens_per_sec), 1) avg_tok_per_sec,
+       ROUND(SUM(duration_ms) / 1000.0 / 60.0, 1) total_minutes
+FROM agent_events
+WHERE model IS NOT NULL
+GROUP BY model ORDER BY total_tokens DESC;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No agent event data yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# Show time-to-completion for each finished item, sorted by duration
+report_cycle_time() {
+  echo ":: Cycle Time by Item"
+  echo ""
+  local result
+  result=$(sql "
+SELECT i.id, SUBSTR(i.title, 1, 40) title, i.priority, i.gate_weight,
+       i.total_attempts attempts,
+       i.cycle_time_s,
+       ROUND(i.cycle_time_s / 60.0, 1) cycle_min,
+       i.final_status
+FROM items i
+WHERE i.completed_at IS NOT NULL
+ORDER BY i.cycle_time_s DESC;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No completed items yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# Show most-touched files across items with gate failure correlation
+report_hotspots() {
+  echo ":: File Hotspots"
+  echo ""
+  local result
+  result=$(sql "
+SELECT d.file_path,
+       COUNT(DISTINCT d.item_id) items,
+       SUM(d.lines_added) added,
+       SUM(d.lines_removed) removed,
+       COUNT(DISTINCT CASE WHEN ge.outcome = 'fail' THEN ge.id END) failures
+FROM diff_stats d
+LEFT JOIN gate_executions ge ON ge.id = d.gate_execution_id
+GROUP BY d.file_path
+ORDER BY items DESC
+LIMIT 20;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No diff stats yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# Show daily completed items: merged, wont-fix, and average cycle time
+report_throughput() {
+  echo ":: Daily Throughput"
+  echo ""
+  local result
+  result=$(sql "
+SELECT DATE(ce.completed_at) day,
+       COUNT(*) completed,
+       SUM(ce.outcome = 'merged') merged,
+       SUM(ce.outcome = 'wont_fix') wont_fix,
+       ROUND(AVG(ce.cycle_time_s) / 60.0, 1) avg_cycle_min
+FROM complete_events ce
+GROUP BY DATE(ce.completed_at)
+ORDER BY day DESC LIMIT 14;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No completion data yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# Compare declared file count from backlog item vs actual files changed
+report_scope() {
+  echo ":: Scope: Declared vs Actual"
+  echo ""
+  local result
+  result=$(sql "
+SELECT i.id, i.file_count declared,
+       ce.files_changed actual,
+       ce.lines_added + ce.lines_removed churn,
+       i.gate_weight,
+       ge_count.attempts
+FROM items i
+JOIN complete_events ce ON ce.item_id = i.id AND ce.outcome = 'merged'
+LEFT JOIN (SELECT item_id, COUNT(*) attempts FROM gate_executions GROUP BY item_id) ge_count ON ge_count.item_id = i.id
+WHERE i.completed_at IS NOT NULL
+ORDER BY churn DESC;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No scope data yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# Show how often gate weight was escalated (e.g., medium -> heavy) mid-run
+report_escalations() {
+  echo ":: Gate Weight Escalations"
+  echo ""
+  local result
+  result=$(sql "
+SELECT gate_weight original, escalated_weight escalated_to,
+       COUNT(*) times,
+       SUM(outcome = 'pass') passed,
+       SUM(outcome = 'fail') failed
+FROM gate_executions
+WHERE escalated_weight IS NOT NULL AND escalated_weight != gate_weight
+GROUP BY gate_weight, escalated_weight;
+")
+  if [[ -z "$result" ]]; then
+    echo "  No escalation data yet."
+  else
+    echo "$result"
+  fi
+  echo ""
+}
+
+# --- main ---
+
+main() {
+  check_db
+
+  local section="${1:-all}"
+
+  case "$section" in
+    all)
+      report_summary
+      report_checks
+      report_dimension_failures
+      report_first_pass_rate
+      report_noise_zone
+      report_consistency
+      report_economics
+      report_cycle_time
+      report_hotspots
+      report_throughput
+      report_scope
+      report_escalations
+      ;;
+    checks) report_checks ;;
+    dimensions) report_dimension_failures ;;
+    first-pass) report_first_pass_rate ;;
+    noise) report_noise_zone ;;
+    consistency) report_consistency ;;
+    summary) report_summary ;;
+    economics) report_economics ;;
+    cycle-time) report_cycle_time ;;
+    hotspots) report_hotspots ;;
+    throughput) report_throughput ;;
+    scope) report_scope ;;
+    escalations) report_escalations ;;
+    *)
+      die "Unknown section: $section. Valid: all, checks, dimensions, first-pass, noise, consistency, summary, economics, cycle-time, hotspots, throughput, scope, escalations"
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "needs.json",
+  "description": "Contract between implementer (producer) and view-assembler/wirer (consumers)",
+  "type": "object",
+  "required": ["feature", "stores", "entry_points"],
+  "additionalProperties": false,
+  "properties": {
+    "feature": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stores": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["type", "observable_properties", "actions"],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "observable_properties": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "actions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "model_types": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "swiftdata_models": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "shared_dependencies": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "entry_points": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "role", "nav"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "type": "string",
+            "enum": ["primary", "secondary", "settings"]
+          },
+          "nav": {
+            "type": "string",
+            "enum": ["tab", "push", "sheet", "fullscreen"]
+          }
+        }
+      }
+    }
+  }
+}
