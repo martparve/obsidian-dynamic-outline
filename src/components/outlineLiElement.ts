@@ -63,6 +63,9 @@ export default class DynamicLiElement {
 				iconSpan.addEventListener("click", (event) =>
 					this._handleCollapseToggle(event)
 				);
+				iconSpan.addEventListener("mousedown", (event) => {
+					event.stopPropagation();
+				});
 			} else {
 				iconSpan.style.cursor = "default";
 			}
