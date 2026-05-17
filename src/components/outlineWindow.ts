@@ -478,6 +478,10 @@ export default class OutlineWindow {
 	}
 
 	private _onDragStart(event: DragEvent): void {
+		if ((event.target as HTMLElement).closest(".dynamic-outline-collapse-icon")) {
+			event.preventDefault();
+			return;
+		}
 		const li = (event.target as HTMLElement).closest("li") as HTMLLIElement;
 		if (!li || this._containerEl.classList.contains("is-searching")) {
 			event.preventDefault();
