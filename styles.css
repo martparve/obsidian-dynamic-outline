@@ -1044,7 +1044,7 @@ button.dynamic-outline-reload[disabled] {
 	padding: 0px 8px;
 	color: var(--dynamic-outline-text-color);
 	text-decoration: none;
-	cursor: default;
+	cursor: grab;
 	flex-grow: 1; /* Allow text to take remaining space */
 	min-width: 0; /* Prevent overflow issues with flex */
 }
