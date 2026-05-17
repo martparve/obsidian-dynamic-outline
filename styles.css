@@ -889,12 +889,25 @@ button.dynamic-outline-reload[disabled] {
 #dynamic-outline li {
 	display: flex;
 	align-items: center;
+	position: relative;
 
 	padding: 7px 0;
 	margin: 1px 0;
 	transition: background 25ms linear;
 
 	border-radius: 6px;
+}
+
+#dynamic-outline li.dragging {
+	opacity: 0.4;
+}
+
+#dynamic-outline li.drop-indicator-above {
+	box-shadow: 0 -2px 0 0 var(--interactive-accent);
+}
+
+#dynamic-outline li.drop-indicator-below {
+	box-shadow: 0 2px 0 0 var(--interactive-accent);
 }
 
 .dynamic-outline-collapse-icon {

@@ -48,6 +48,8 @@ export default class DynamicLiElement {
 			attr: {
 				"data-heading-line": heading.position.start.line,
 				"data-level": tabLevel,
+				"data-heading-index": index,
+				draggable: "true",
 			},
 		});
 
