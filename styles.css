@@ -890,6 +890,7 @@ button.dynamic-outline-reload[disabled] {
 	display: flex;
 	align-items: center;
 	position: relative;
+	cursor: grab;
 
 	padding: 7px 0;
 	margin: 1px 0;
@@ -900,6 +901,7 @@ button.dynamic-outline-reload[disabled] {
 
 #dynamic-outline li.dragging {
 	opacity: 0.4;
+	cursor: grabbing;
 }
 
 #dynamic-outline li.drop-indicator-above {
