@@ -19,6 +19,7 @@ export default class OutlineWindow {
 	private _allCollapsed = false;
 	private _draggedIndex = -1;
 	private _dragStartX = 0;
+	private _rulerEl!: HTMLDivElement;
 	private _pinned = false;
 
 	constructor(plugin: DynamicOutlinePlugin, outline: Outline) {
@@ -435,6 +436,9 @@ export default class OutlineWindow {
 		contentElement.addEventListener("dragend", () => this._onDragEnd());
 		mainElement.appendChild(contentElement);
 
+		this._rulerEl = createEl("div", { cls: "dynamic-outline-ruler" });
+		mainElement.appendChild(this._rulerEl);
+
 		return mainElement;
 	}
 
@@ -521,6 +525,8 @@ export default class OutlineWindow {
 			} else if (deltaX >= 40) {
 				li.classList.add("level-change-right");
 			}
+			const levelDelta = Math.round(deltaX / 40);
+			this._showRuler(levelDelta);
 			return;
 		}
 		const rect = li.getBoundingClientRect();
@@ -566,6 +572,49 @@ export default class OutlineWindow {
 		this._containerEl
 			.querySelectorAll(".drop-indicator-above, .drop-indicator-below, .level-change-left, .level-change-right")
 			.forEach((el) => el.classList.remove("drop-indicator-above", "drop-indicator-below", "level-change-left", "level-change-right"));
+		this._rulerEl.style.display = "none";
+	}
+
+	private _showRuler(levelDelta: number): void {
+		if (levelDelta === 0) {
+			this._rulerEl.style.display = "none";
+			return;
+		}
+		const currentLevel = this._latestHeadings[this._draggedIndex].level;
+		const targetLevel = Math.max(1, Math.min(6, currentLevel + levelDelta));
+		if (targetLevel === currentLevel) {
+			this._rulerEl.style.display = "none";
+			return;
+		}
+
+		const containerRect = this._containerEl.getBoundingClientRect();
+		let xPos: number | null = null;
+
+		const matchingLi = this._containerEl.querySelector(
+			`li.li-heading-level-${targetLevel}:not(.dragging)`
+		) as HTMLLIElement | null;
+		if (matchingLi) {
+			const anchor = matchingLi.querySelector("a");
+			if (anchor) {
+				xPos = anchor.getBoundingClientRect().left - containerRect.left;
+			}
+		}
+
+		if (xPos === null) {
+			const draggedLi = this._containerEl.querySelector("li.dragging") as HTMLLIElement | null;
+			if (draggedLi) {
+				const anchor = draggedLi.querySelector("a");
+				if (anchor) {
+					const tabSize = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--dynamic-outline-li-padding-tab-size")) || 16;
+					xPos = anchor.getBoundingClientRect().left - containerRect.left + (levelDelta * tabSize);
+				}
+			}
+		}
+
+		if (xPos !== null) {
+			this._rulerEl.style.left = xPos + "px";
+			this._rulerEl.style.display = "block";
+		}
 	}
 
 	private _getSectionRange(headingIndex: number): { start: number; end: number } {

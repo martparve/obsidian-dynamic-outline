@@ -920,6 +920,18 @@ button.dynamic-outline-reload[disabled] {
 	box-shadow: 3px 0 0 0 var(--interactive-accent);
 }
 
+.dynamic-outline-ruler {
+	display: none;
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background-color: var(--text-faint);
+	opacity: 0.3;
+	pointer-events: none;
+	z-index: 1;
+}
+
 .dynamic-outline-collapse-icon {
 	/* background-color: var(--color-green); */
 	display: flex;
